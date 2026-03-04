@@ -1,0 +1,260 @@
+---
+title: "useRateLimit"
+description: "React hook for real-time rate limit status in your components"
+---
+
+## Overview
+
+The `useRateLimit` hook provides real-time rate limit information in your React components. It monitors the current rate limit status and automatically updates when capacity changes, allowing you to show users when they can retry an action.
+
+## Function Signature
+
+```typescript
+function useRateLimit(
+  getRateLimitValueQuery: GetRateLimitValueQuery,
+  opts?: UseRateLimitOptions
+): {
+  status: { ok: true; retryAt: undefined } | { ok: false; retryAt: number } | undefined;
+  check: (ts?: number, count?: number) => CheckResult | undefined;
+}
+```
+
+### Type Definitions
+
+```typescript
+type GetRateLimitValueQuery = FunctionReference<
+  "query",
+  "public",
+  GetValueArgs,
+  GetValueReturns
+>;
+
+type UseRateLimitOptions = {
+  name?: string;
+  key?: string;
+  count?: number;
+  sampleShards?: number;
+  getServerTimeMutation?: GetServerTimeMutation;
+  config?: RateLimitConfig;
+};
+
+type GetServerTimeMutation = FunctionReference<
+  "mutation",
+  "public",
+  Record<string, never>,
+  number
+>;
+```
+
+## Parameters
+
+<ParamField path="getRateLimitValueQuery" type="GetRateLimitValueQuery" required>
+  The query function returned by `rateLimiter.hookAPI().getRateLimit`. This query retrieves the current rate limit value from the server.
+</ParamField>
+
+<ParamField path="opts" type="UseRateLimitOptions">
+  Optional configuration object for the hook.
+
+  <Expandable title="properties">
+    <ParamField path="name" type="string">
+      The name of the rate limit. If not provided, uses the name from the server configuration.
+    </ParamField>
+
+    <ParamField path="key" type="string">
+      The key for a per-user/per-session rate limit. Only works if the server-side `hookAPI()` configuration allows client-provided keys.
+    </ParamField>
+
+    <ParamField path="count" type="number" default="1">
+      The number of tokens to check against. Used to determine if there's enough capacity for an operation that consumes multiple tokens.
+    </ParamField>
+
+    <ParamField path="sampleShards" type="number" default="1">
+      Number of shards to sample when checking rate limit status. Higher values provide more accurate results for sharded rate limits.
+    </ParamField>
+
+    <ParamField path="getServerTimeMutation" type="GetServerTimeMutation">
+      A mutation that returns the current server time (`Date.now()`). **Highly recommended** for accurate time synchronization between client and server. Use the mutation returned by `rateLimiter.hookAPI().getServerTime`.
+    </ParamField>
+
+    <ParamField path="config" type="RateLimitConfig">
+      Inline rate limit configuration. Only needed if the rate limit wasn't defined in the `RateLimiter` constructor and isn't provided by the server query.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Return Value
+
+<ResponseField name="status" type="object | undefined">
+  The current rate limit status. `undefined` while loading.
+
+  When `ok: true`:
+  <Expandable title="properties">
+    <ResponseField name="ok" type="true">
+      The rate limit check passed - there's enough capacity.
+    </ResponseField>
+
+    <ResponseField name="retryAt" type="undefined">
+      No retry needed.
+    </ResponseField>
+  </Expandable>
+
+  When `ok: false`:
+  <Expandable title="properties">
+    <ResponseField name="ok" type="false">
+      The rate limit would be exceeded.
+    </ResponseField>
+
+    <ResponseField name="retryAt" type="number">
+      Client-time timestamp (in milliseconds) when the action can be retried with enough capacity.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="check" type="function">
+  A function to manually check the rate limit at a specific time or for a different token count.
+
+  **Signature**: `(ts?: number, count?: number) => CheckResult | undefined`
+
+  <Expandable title="parameters">
+    <ParamField path="ts" type="number">
+      Client timestamp to check the rate limit at. Defaults to `Date.now()`.
+    </ParamField>
+
+    <ParamField path="count" type="number">
+      Number of tokens to check. Defaults to the `count` from hook options or `1`.
+    </ParamField>
+  </Expandable>
+
+  Returns `CheckResult | undefined`:
+  ```typescript
+  type CheckResult = {
+    value: number;        // Current token value
+    ts: number;          // Client timestamp of the value
+    config: RateLimitConfig;  // The rate limit configuration
+    shard: number;       // The shard number
+    ok: boolean;         // Whether the check passed
+    retryAt?: number;    // Client timestamp when retry would succeed
+  }
+  ```
+</ResponseField>
+
+## Usage Example
+
+### Basic React Component
+
+```tsx
+import { useRateLimit } from "@convex-dev/rate-limiter/react";
+import { api } from "./convex/_generated/api";
+
+function SendMessageButton() {
+  const { status, check } = useRateLimit(
+    api.messages.getRateLimit,
+    {
+      // Recommended: sync client/server clocks
+      getServerTimeMutation: api.messages.getServerTime,
+      // Check if we have capacity for 1 message
+      count: 1,
+    }
+  );
+
+  if (!status) {
+    return <button disabled>Loading...</button>;
+  }
+
+  if (!status.ok) {
+    const waitSeconds = Math.ceil((status.retryAt - Date.now()) / 1000);
+    return (
+      <button disabled>
+        Wait {waitSeconds}s before sending
+      </button>
+    );
+  }
+
+  return <button onClick={handleSend}>Send Message</button>;
+}
+```
+
+### With Manual Checking
+
+```tsx
+function TokenConsumer() {
+  const [tokenCount, setTokenCount] = useState(10);
+  const { status, check } = useRateLimit(
+    api.llm.getRateLimit,
+    {
+      getServerTimeMutation: api.llm.getServerTime,
+    }
+  );
+
+  // Check if we have capacity for the current token count
+  const result = check(Date.now(), tokenCount);
+
+  return (
+    <div>
+      <input
+        type="number"
+        value={tokenCount}
+        onChange={(e) => setTokenCount(Number(e.target.value))}
+      />
+      {result && (
+        <div>
+          {result.ok ? (
+            <p>Available capacity: {result.value} tokens</p>
+          ) : (
+            <p>Retry in {Math.ceil((result.retryAt - Date.now()) / 1000)}s</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+## Time Synchronization
+
+The hook uses `getServerTimeMutation` to synchronize the client and server clocks. This is **highly recommended** because:
+
+1. Client clocks can be inaccurate or intentionally set incorrectly
+2. The rate limit calculations happen server-side using server time
+3. Without synchronization, `retryAt` values may be incorrect
+
+### How It Works
+
+```typescript
+// The hook measures latency and calculates the offset
+const clientTime = Date.now();
+const serverTime = await convex.mutation(getServerTimeMutation, {});
+const latency = Date.now() - clientTime;
+const timeOffset = serverTime - clientTime - latency / 2;
+
+// All times are then adjusted
+const adjustedRetryAt = serverRetryTime - timeOffset;
+```
+
+### Server Setup
+
+The `getServerTime` mutation is automatically included when you use `hookAPI()`:
+
+```ts
+// In convex/messages.ts
+export const { getRateLimit, getServerTime } = rateLimiter.hookAPI(
+  "sendMessage",
+  {
+    key: async (ctx) => await getUserId(ctx),
+  }
+);
+```
+
+## Advanced Patterns
+
+See [React Hooks Guide](/advanced/react-hooks) for more examples including:
+- Displaying countdown timers
+- Optimistic UI updates
+- Multi-token operations
+- Custom retry strategies
+
+## Related
+
+- [hookAPI()](/api/hook-api) - Set up server-side queries for the hook
+- [React Hooks Guide](/advanced/react-hooks) - Advanced usage patterns
+- [getValue()](/api/get-value) - Direct value fetching

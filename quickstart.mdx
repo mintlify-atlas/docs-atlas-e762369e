@@ -1,80 +1,224 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get started with Convex Rate Limiter in minutes
 ---
 
-## Get started in three steps
+This guide walks you through setting up and using the Convex Rate Limiter component with real examples.
 
-Get your documentation site running locally and make your first customization.
+<Steps>
 
-### Step 1: Set up your local environment
+<Step title="Install the Package">
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+First, install the rate limiter component:
 
-### Step 2: Deploy your changes
+<CodeGroup>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+```bash npm
+npm install @convex-dev/rate-limiter
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+```bash yarn
+yarn add @convex-dev/rate-limiter
+```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+```bash pnpm
+pnpm add @convex-dev/rate-limiter
+```
 
-### Step 3: Go live
+</CodeGroup>
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+</Step>
 
-## Next steps
+<Step title="Configure convex.config.ts">
 
-Now that you have your docs running, explore these key features:
+Create or update `convex/convex.config.ts` to register the component:
 
-<CardGroup cols={2}>
+```typescript convex/convex.config.ts
+import { defineApp } from "convex/server";
+import rateLimiter from "@convex-dev/rate-limiter/convex.config.js";
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+const app = defineApp();
+app.use(rateLimiter);
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+export default app;
+```
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+</Step>
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+<Step title="Define Your Rate Limits">
 
-</CardGroup>
+Create a new file (e.g., `convex/rateLimits.ts`) and define your rate limits:
+
+```typescript convex/rateLimits.ts
+import { RateLimiter, MINUTE, HOUR } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+export const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // A per-user limit, allowing one every ~6 seconds.
+  // Allows up to 3 in quick succession if they haven't sent many recently.
+  sendMessage: { kind: "token bucket", rate: 10, period: MINUTE, capacity: 3 },
+  
+  // One global / singleton rate limit for free trial signups
+  freeTrialSignUp: { kind: "fixed window", rate: 100, period: HOUR },
+});
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  **Rate limit strategies:**
+  - **Token bucket**: Tokens are added at a steady rate, allowing bursts up to `capacity`
+  - **Fixed window**: All tokens granted at once every `period`, with optional rollover
 </Note>
+
+</Step>
+
+<Step title="Use in a Mutation - Global Rate Limit">
+
+Apply a global rate limit that applies to all users:
+
+```typescript convex/users.ts
+import { mutation } from "./_generated/server";
+import { rateLimiter } from "./rateLimits";
+
+export const signUpForFreeTrial = mutation({
+  args: { /* ... */ },
+  handler: async (ctx, args) => {
+    // Check global rate limit for free trial signups
+    const { ok, retryAfter } = await rateLimiter.limit(ctx, "freeTrialSignUp");
+    
+    if (!ok) {
+      throw new Error(
+        `Rate limit exceeded. Please try again in ${Math.ceil(retryAfter! / 1000)} seconds.`
+      );
+    }
+    
+    // Proceed with signup logic...
+  },
+});
+```
+
+</Step>
+
+<Step title="Use in a Mutation - Per-User Rate Limit">
+
+Apply a rate limit specific to each user using a `key`:
+
+```typescript convex/messages.ts
+import { mutation } from "./_generated/server";
+import { v } from "convex/values";
+import { rateLimiter } from "./rateLimits";
+
+export const sendMessage = mutation({
+  args: {
+    text: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const user = await ctx.auth.getUserIdentity();
+    if (!user) {
+      throw new Error("Not authenticated");
+    }
+    
+    // Rate limit per user
+    const { ok, retryAfter } = await rateLimiter.limit(ctx, "sendMessage", {
+      key: user.subject,
+    });
+    
+    if (!ok) {
+      throw new Error(
+        `You're sending messages too quickly. Please wait ${Math.ceil(retryAfter! / 1000)} seconds.`
+      );
+    }
+    
+    // Save the message
+    await ctx.db.insert("messages", {
+      text: args.text,
+      userId: user.subject,
+      timestamp: Date.now(),
+    });
+  },
+});
+```
+
+</Step>
+
+<Step title="Error Handling with throws Option">
+
+For cleaner code, use the `throws` option to automatically throw errors when rate limits are exceeded:
+
+```typescript convex/auth.ts
+import { mutation } from "./_generated/server";
+import { v } from "convex/values";
+import { RateLimiter, HOUR, isRateLimitError } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  failedLogins: { kind: "token bucket", rate: 10, period: HOUR },
+});
+
+export const login = mutation({
+  args: {
+    email: v.string(),
+    password: v.string(),
+  },
+  handler: async (ctx, args) => {
+    try {
+      // Automatically throw if rate limit is exceeded
+      await rateLimiter.limit(ctx, "failedLogins", {
+        key: args.email,
+        throws: true,
+      });
+      
+      // Attempt login...
+      const success = await attemptLogin(args.email, args.password);
+      
+      if (success) {
+        // Reset rate limit on successful login
+        await rateLimiter.reset(ctx, "failedLogins", { key: args.email });
+      }
+      
+      return { success };
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        throw new Error(
+          `Too many failed login attempts. Please try again later.`
+        );
+      }
+      throw error;
+    }
+  },
+});
+
+function attemptLogin(email: string, password: string) {
+  // Your login logic here
+  return true;
+}
+```
+
+<Warning>
+  When using `throws: true`, the rate limiter throws a `ConvexError` with data `{kind: "RateLimited", name, retryAfter}`. Use `isRateLimitError()` to check if an error is a rate limit error.
+</Warning>
+
+</Step>
+
+</Steps>
+
+## What You've Learned
+
+You now know how to:
+
+- Install and configure the Convex Rate Limiter component
+- Define rate limits with different strategies (token bucket and fixed window)
+- Apply global rate limits that affect all users
+- Apply per-user rate limits using keys
+- Handle rate limit errors gracefully
+- Reset rate limits when needed
+
+## Next Steps
+
+Explore more advanced features:
+
+- **Custom token counts**: Consume multiple tokens in a single request for LLM token limiting
+- **Sharding**: Scale to high throughput with configurable sharding
+- **Reservations**: Reserve capacity to avoid starvation on larger requests
+- **React hook**: Check rate limits from your frontend with `useRateLimit`
+
+For detailed information, check out the [full Stack post on rate limiting](https://stack.convex.dev/rate-limiting).

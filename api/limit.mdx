@@ -1,0 +1,227 @@
+---
+title: limit()
+description: Check and consume rate limit tokens in mutations
+---
+
+## Overview
+
+The `limit()` method checks a rate limit and consumes tokens if available. This is the primary method for enforcing rate limits in your mutations.
+
+## Method Signature
+
+```typescript
+async limit<Name extends string = keyof Limits & string>(
+  ctx: RunMutationCtx,
+  name: Name,
+  ...options: Name extends keyof Limits & string
+    ? [WithKnownNameOrInlinedConfig<Limits, Name, RateLimitArgs>?]
+    : [WithKnownNameOrInlinedConfig<Limits, Name, RateLimitArgs>]
+): Promise<RateLimitReturns>
+```
+
+## Parameters
+
+<ParamField path="ctx" type="RunMutationCtx" required>
+  The context object from a mutation, including `runMutation`. This can be the full mutation context or any object that provides `runMutation`.
+</ParamField>
+
+<ParamField path="name" type="string" required>
+  The name of the rate limit to check. If this name was defined in the `RateLimiter` constructor, it will be type-checked and auto-completed.
+</ParamField>
+
+<ParamField path="options" type="object">
+  Optional configuration for this rate limit check.
+  
+  <ParamField path="key" type="string">
+    A unique identifier for this rate limit instance. Use this to create per-user, per-IP, or other scoped rate limits. If not provided, the rate limit is shared globally.
+  </ParamField>
+  
+  <ParamField path="count" type="number" default="1">
+    The number of tokens to consume. Useful for rate limiting based on request size or cost.
+  </ParamField>
+  
+  <ParamField path="reserve" type="boolean" default="false">
+    If `true`, reserves tokens for future use instead of consuming them immediately. The returned `retryAfter` indicates when the reserved work should be executed.
+  </ParamField>
+  
+  <ParamField path="throws" type="boolean" default="false">
+    If `true`, throws a `ConvexError` with `RateLimitError` data when the rate limit is exceeded. If `false`, returns `{ ok: false, retryAfter }` instead.
+  </ParamField>
+  
+  <ParamField path="config" type="RateLimitConfig">
+    The rate limit configuration. Required only if the rate limit name was not defined in the `RateLimiter` constructor. See [RateLimitConfig](/api/types) for details.
+  </ParamField>
+</ParamField>
+
+## Return Type
+
+<ResponseField name="RateLimitReturns" type="object">
+  Returns a promise that resolves to one of two shapes:
+  
+  **When rate limit is not exceeded:**
+  <ResponseField name="ok" type="true" required>
+    Indicates the request is allowed.
+  </ResponseField>
+  
+  <ResponseField name="retryAfter" type="number">
+    Only present when `reserve: true`. The duration in milliseconds to wait before executing the reserved work.
+  </ResponseField>
+  
+  **When rate limit is exceeded (and `throws: false`):**
+  <ResponseField name="ok" type="false" required>
+    Indicates the rate limit was exceeded.
+  </ResponseField>
+  
+  <ResponseField name="retryAfter" type="number" required>
+    The duration in milliseconds when retrying could succeed.
+  </ResponseField>
+</ResponseField>
+
+## Examples
+
+### Basic Usage
+
+```typescript
+import { mutation } from "./_generated/server";
+import { v } from "convex/values";
+import { rateLimiter } from "./rateLimiter";
+
+export const sendMessage = mutation({
+  args: { text: v.string() },
+  handler: async (ctx, args) => {
+    const status = await rateLimiter.limit(ctx, "sendMessage");
+    
+    if (!status.ok) {
+      throw new Error(`Rate limited. Retry in ${status.retryAfter}ms`);
+    }
+    
+    // Proceed with sending message
+    await ctx.db.insert("messages", { text: args.text });
+  },
+});
+```
+
+### With Key (Per-User Limit)
+
+```typescript
+export const sendMessage = mutation({
+  args: { text: v.string() },
+  handler: async (ctx, args) => {
+    const userId = await getCurrentUser(ctx);
+    
+    const status = await rateLimiter.limit(ctx, "sendMessage", {
+      key: userId,
+    });
+    
+    if (!status.ok) {
+      return { error: `Rate limited. Retry in ${status.retryAfter}ms` };
+    }
+    
+    // Send message
+  },
+});
+```
+
+### With Custom Count
+
+```typescript
+export const uploadFile = mutation({
+  args: { size: v.number() },
+  handler: async (ctx, args) => {
+    // Consume tokens based on file size (1 token per MB)
+    const tokensNeeded = Math.ceil(args.size / 1_000_000);
+    
+    const status = await rateLimiter.limit(ctx, "upload", {
+      key: ctx.userId,
+      count: tokensNeeded,
+    });
+    
+    if (!status.ok) {
+      throw new Error("Upload quota exceeded");
+    }
+    
+    // Proceed with upload
+  },
+});
+```
+
+### With Reserve (Scheduled Execution)
+
+```typescript
+export const scheduleEmail = mutation({
+  args: { recipientId: v.id("users") },
+  handler: async (ctx, args) => {
+    const status = await rateLimiter.limit(ctx, "sendEmail", {
+      key: args.recipientId,
+      reserve: true,
+    });
+    
+    if (!status.ok) {
+      return { error: "Email quota exceeded" };
+    }
+    
+    // Schedule the email to be sent after retryAfter ms
+    if (status.retryAfter) {
+      await ctx.scheduler.runAfter(
+        status.retryAfter,
+        internal.email.send,
+        { recipientId: args.recipientId }
+      );
+    } else {
+      // Send immediately
+      await ctx.scheduler.runAfter(0, internal.email.send, {
+        recipientId: args.recipientId,
+      });
+    }
+  },
+});
+```
+
+### With Throws
+
+```typescript
+import { isRateLimitError } from "@convex-dev/rate-limiter";
+
+export const createAccount = mutation({
+  args: { email: v.string() },
+  handler: async (ctx, args) => {
+    try {
+      await rateLimiter.limit(ctx, "accountCreation", {
+        key: args.email,
+        throws: true,
+      });
+      
+      // Create account
+      await ctx.db.insert("users", { email: args.email });
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        throw new Error(
+          `Too many account creation attempts. ` +
+          `Please try again in ${error.data.retryAfter}ms`
+        );
+      }
+      throw error;
+    }
+  },
+});
+```
+
+## Notes
+
+<Note>
+  The `limit()` method can only be called from mutations or within `runMutation`. For queries, use [`check()`](/api/check) instead.
+</Note>
+
+<Note>
+  When `reserve: true` is used, the tokens are consumed immediately, but `retryAfter` indicates when the work should be performed to respect the rate limit.
+</Note>
+
+<Note>
+  If you use `throws: true` and the rate limit is exceeded, you can catch the error with `isRateLimitError()` to access the `retryAfter` value in the error data.
+</Note>
+
+## Related Methods
+
+- [`check()`](/api/check) - Check rate limit without consuming tokens
+- [`reset()`](/api/reset) - Reset a rate limit
+- [`getValue()`](/api/get-value) - Get current rate limit state

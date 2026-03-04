@@ -1,0 +1,275 @@
+---
+title: Custom Counts
+description: Use the count parameter for non-uniform token consumption
+---
+
+## Overview
+
+By default, each call to `limit()` consumes exactly 1 token. But many use cases require consuming different amounts based on the operation being performed.
+
+The `count` parameter lets you consume multiple tokens in a single call.
+
+## Using the count Parameter
+
+```ts
+const status = await rateLimiter.limit(ctx, "llmTokens", { 
+  count: tokens 
+});
+```
+
+## Example: LLM Token Consumption
+
+When calling an LLM API, you want to limit based on tokens consumed, not number of requests:
+
+```ts
+import { RateLimiter, MINUTE } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+import { action } from "./_generated/server";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Allow 40,000 tokens per minute across all requests
+  llmTokens: { kind: "token bucket", rate: 40000, period: MINUTE, shards: 10 },
+});
+
+export const generateText = action({
+  args: { prompt: v.string() },
+  handler: async (ctx, args) => {
+    // Estimate token count (4 chars ≈ 1 token)
+    const estimatedTokens = Math.ceil(args.prompt.length / 4);
+    
+    // Check if we have enough token quota
+    const status = await rateLimiter.limit(ctx, "llmTokens", { 
+      count: estimatedTokens,
+      throws: true,
+    });
+    
+    // Call the LLM API
+    const response = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages: [{ role: "user", content: args.prompt }],
+    });
+    
+    return response.choices[0].message.content;
+  },
+});
+```
+
+<Note>
+From the README: "Consume multiple in one request to prevent rate limits on an LLM API."
+</Note>
+
+## Example: File Size Limits
+
+Rate limit file uploads based on file size rather than number of uploads:
+
+```ts
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Allow 100MB per hour per user
+  uploadBandwidth: { kind: "token bucket", rate: 100_000_000, period: HOUR },
+});
+
+export const uploadFile = mutation({
+  args: { 
+    userId: v.string(),
+    fileSizeBytes: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const { ok, retryAfter } = await rateLimiter.limit(ctx, "uploadBandwidth", {
+      key: args.userId,
+      count: args.fileSizeBytes,
+    });
+    
+    if (!ok) {
+      throw new Error(`Upload quota exceeded. Try again in ${Math.ceil(retryAfter! / 1000)}s`);
+    }
+    
+    // Process the file upload
+  },
+});
+```
+
+## Example: Batch Operations
+
+Consume tokens proportional to batch size:
+
+```ts
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  batchInsert: { kind: "token bucket", rate: 1000, period: MINUTE },
+});
+
+export const insertDocuments = mutation({
+  args: { documents: v.array(v.object({ name: v.string() })) },
+  handler: async (ctx, args) => {
+    // Consume tokens based on batch size
+    await rateLimiter.limit(ctx, "batchInsert", {
+      count: args.documents.length,
+      throws: true,
+    });
+    
+    // Insert all documents
+    for (const doc of args.documents) {
+      await ctx.db.insert("documents", doc);
+    }
+  },
+});
+```
+
+## Real Example from Source Code
+
+From `example/convex/example.ts`:
+
+```ts
+export const consumeTokens = mutation({
+  args: {
+    count: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const user = await ctx.auth.getUserIdentity();
+    const key = user?.subject ?? "anonymous";
+    
+    return rateLimiter.limit(ctx, "demoLimit", {
+      count: args.count || 1,
+      key,
+    });
+  },
+});
+```
+
+## When to Use Custom Counts
+
+<CardGroup cols={2}>
+  <Card title="Variable Cost Operations" icon="scale-balanced">
+    When different requests have different "costs":
+    - LLM API calls (token usage)
+    - Image generation (resolution/quality)
+    - Database queries (complexity)
+  </Card>
+  
+  <Card title="Resource Consumption" icon="gauge-high">
+    When limiting based on resource usage:
+    - File upload bandwidth
+    - Storage space
+    - API credits
+  </Card>
+  
+  <Card title="Batch Operations" icon="layer-group">
+    When processing multiple items:
+    - Bulk inserts
+    - Batch exports
+    - Multiple file uploads
+  </Card>
+  
+  <Card title="Tiered Usage" icon="stairs">
+    When requests have different weights:
+    - Premium vs free features
+    - Expensive vs cheap operations
+    - Priority queues
+  </Card>
+</CardGroup>
+
+## Combining with Per-User Limits
+
+Custom counts work perfectly with per-user rate limiting:
+
+```ts
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Each user gets 40,000 tokens per minute
+  llmTokens: { kind: "token bucket", rate: 40000, period: MINUTE },
+});
+
+export const chat = action({
+  args: { 
+    userId: v.string(),
+    message: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const tokenCount = estimateTokens(args.message);
+    
+    // Per-user token limit
+    await rateLimiter.limit(ctx, "llmTokens", {
+      key: args.userId,
+      count: tokenCount,
+      throws: true,
+    });
+    
+    // Make API call
+  },
+});
+```
+
+## Fractional Counts
+
+Counts can be fractional (floating-point numbers):
+
+```ts
+// Consume 0.5 tokens for lightweight operations
+await rateLimiter.limit(ctx, "apiRequest", { count: 0.5 });
+
+// Consume 2.5 tokens for medium operations
+await rateLimiter.limit(ctx, "apiRequest", { count: 2.5 });
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Estimate conservatively">
+    When estimating costs (like LLM tokens), err on the side of overestimating to avoid hitting external API limits:
+    
+    ```ts
+    // Add 20% buffer for safety
+    const estimatedTokens = Math.ceil(prompt.length / 4 * 1.2);
+    ```
+  </Accordion>
+  
+  <Accordion title="Use appropriate rate limits">
+    Match your rate limits to the metric you're counting:
+    
+    ```ts
+    // For tokens: higher rate, longer period
+    llmTokens: { rate: 40000, period: MINUTE }
+    
+    // For bytes: very high rate
+    uploadBandwidth: { rate: 100_000_000, period: HOUR }
+    
+    // For count of items: moderate rate
+    batchOperations: { rate: 1000, period: MINUTE }
+    ```
+  </Accordion>
+  
+  <Accordion title="Validate count parameter">
+    If the count comes from user input, validate it:
+    
+    ```ts
+    if (args.count < 1 || args.count > 10000) {
+      throw new Error("Invalid count");
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Consider checking before consuming">
+    For expensive operations, check availability first:
+    
+    ```ts
+    // Check if we have enough tokens
+    const check = await rateLimiter.check(ctx, "llmTokens", { 
+      count: estimatedTokens 
+    });
+    
+    if (!check.ok) {
+      return { error: "Insufficient quota", retryAfter: check.retryAfter };
+    }
+    
+    // Now consume and proceed
+    await rateLimiter.limit(ctx, "llmTokens", { 
+      count: estimatedTokens,
+      throws: true,
+    });
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+- Learn about [Checking Limits](/usage/checking-limits) without consuming tokens
+- Understand [Error Handling](/usage/error-handling) for custom counts
+- Explore [Sharding](/advanced/sharding) for high-throughput limits

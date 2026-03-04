@@ -1,0 +1,129 @@
+---
+title: Sharding for Scale
+description: Use sharding to handle high-throughput rate limits without compromising correctness
+---
+
+## Why Sharding?
+
+When many requests happen simultaneously, they all try to modify the same rate limit values in the database. Because Convex provides strong transactions, requests will never overwrite each other incorrectly, so your rate limiter will never allow more requests than configured.
+
+However, high contention for these values causes [optimistic concurrency control (OCC) conflicts](https://stack.convex.dev/how-convex-works#read-and-write-sets). Convex automatically retries these conflicts with backoff, but it's better to avoid them in the first place.
+
+## How Sharding Works
+
+Sharding breaks up the total capacity into individual buckets, or "shards". When consuming capacity, the rate limiter checks a random shard. While you might occasionally get rate limited when capacity exists elsewhere, you'll never violate the rate limit's upper bound.
+
+```ts
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Use sharding to increase throughput without compromising on correctness
+  llmTokens: { kind: "token bucket", rate: 40000, period: MINUTE, shards: 10 },
+  llmRequests: { kind: "fixed window", rate: 1000, period: MINUTE, shards: 10 },
+});
+```
+
+## Power of Two Technique
+
+The implementation uses an advanced load balancing technique: it checks **two** random shards and uses the one with more capacity. This keeps shards relatively balanced.
+
+The rate limiter will also **combine** the capacity of both shards if neither has enough on their own, based on the [power of two choices technique](https://www.eecs.harvard.edu/~michaelm/postscripts/tpds2001.pdf).
+
+## Calculating Optimal Shard Count
+
+Use this formula to estimate the number of shards needed:
+
+```
+shards ≈ max queries per second / 2
+```
+
+For example, handling 1,000 queries per minute (~17 QPS) with 10 shards:
+
+```ts
+llmRequests: { kind: "fixed window", rate: 1000, period: MINUTE, shards: 10 }
+```
+
+### Best Practices
+
+- Each shard should have **at least 5-10 capacity** (ideally 10 or more)
+- For the example above: 1000 rate / 10 shards = 100 capacity per shard ✓
+- Don't expect normal traffic to exceed ~20 QPS with this configuration
+
+## Scaling a Rate Limit
+
+If you want a rate like `{ rate: 100, period: SECOND }` and you're flexible on the overall period, you can shard it by increasing both the rate and period proportionally:
+
+```ts
+// Original: too fast, needs sharding
+{ rate: 100, period: SECOND }
+
+// Better: same rate, more capacity per shard
+{ shards: 50, rate: 250, period: 2.5 * SECOND }
+
+// Best: much better capacity per shard
+{ shards: 50, rate: 1000, period: 10 * SECOND }
+```
+
+This gives each shard more capacity while maintaining the same overall rate limit.
+
+## Trade-offs
+
+<Warning>
+  **Occasional false negatives**: With sharding, you might occasionally be rate limited even when capacity exists in other shards. This is the trade-off for avoiding OCC conflicts.
+</Warning>
+
+### When to Use Sharding
+
+**Use sharding when:**
+- You expect high concurrent load (>10 QPS per rate limit)
+- You're experiencing OCC conflicts
+- You need to scale beyond single-shard throughput
+
+**Don't use sharding when:**
+- Traffic is low (< 5 QPS)
+- You need exact capacity guarantees at all times
+- Each shard would have < 5 capacity
+
+## Complete Example
+
+```ts
+import { RateLimiter, MINUTE, HOUR } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Low traffic: no sharding needed
+  sendMessage: { kind: "token bucket", rate: 10, period: MINUTE },
+  
+  // High traffic: use sharding
+  llmTokens: {
+    kind: "token bucket",
+    rate: 40000,
+    period: MINUTE,
+    shards: 10,
+    // 40000 / 10 = 4000 capacity per shard ✓
+  },
+  
+  // Very high traffic with scaled period
+  apiRequests: {
+    kind: "fixed window",
+    rate: 10000,
+    period: 10 * MINUTE,
+    shards: 50,
+    // 10000 / 50 = 200 capacity per shard ✓
+  },
+});
+
+// Usage is identical whether sharded or not
+export const consumeTokens = mutation({
+  args: { tokens: v.number() },
+  handler: async (ctx, args) => {
+    const status = await rateLimiter.limit(ctx, "llmTokens", {
+      count: args.tokens,
+    });
+    
+    if (!status.ok) {
+      throw new Error(`Rate limited. Retry after ${status.retryAfter}ms`);
+    }
+    
+    // Proceed with operation
+  },
+});
+```

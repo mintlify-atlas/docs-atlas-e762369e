@@ -1,0 +1,329 @@
+---
+title: Error Handling
+description: Handle rate limit violations with automatic errors or manual checks
+---
+
+## Overview
+
+The Convex Rate Limiter provides two approaches to handling rate limit violations:
+
+1. **Manual handling**: Check the `ok` property and handle errors yourself
+2. **Automatic errors**: Use `throws: true` to automatically throw errors
+
+## Manual Error Handling (Default)
+
+By default, `limit()` returns `{ ok, retryAfter }` and never throws:
+
+```ts
+const { ok, retryAfter } = await rateLimiter.limit(ctx, "sendMessage", {
+  key: userId,
+});
+
+if (!ok) {
+  return { 
+    error: `Rate limit exceeded. Try again in ${retryAfter}ms`,
+    retryAfter,
+  };
+}
+
+// Continue with the operation
+```
+
+This approach gives you full control over the error response.
+
+## Automatic Error Throwing
+
+Use `throws: true` to automatically throw a `ConvexError` when the rate limit is exceeded:
+
+```ts
+await rateLimiter.limit(ctx, "sendMessage", {
+  key: userId,
+  throws: true,
+});
+
+// If we reach here, the rate limit was not exceeded
+```
+
+From the README:
+> "It throws a `ConvexError` with `RateLimitError` data (`data: {kind, name, retryAfter}`) instead of returning when `ok` is false."
+
+## Real Example from Source Code
+
+From `example/convex/example.ts`:
+
+```ts
+export const test = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    // First request succeeds with throws: true
+    const first = await rateLimiter.limit(ctx, "sendMessage", {
+      key: "user1",
+      throws: true,
+    });
+    assert(first.ok);
+    assert(!first.retryAfter);
+    
+    // Second request succeeds
+    const second = await rateLimiter.limit(ctx, "sendMessage", {
+      key: "user1",
+    });
+    assert(second.ok);
+    
+    // Third request succeeds
+    await rateLimiter.limit(ctx, "sendMessage", {
+      key: "user1",
+      throws: true,
+    });
+    
+    let threw = false;
+    // Fourth request should throw (capacity exceeded)
+    try {
+      await rateLimiter.limit(ctx, "sendMessage", {
+        key: "user1",
+        throws: true,
+      });
+    } catch (e) {
+      threw = true;
+      assert(isRateLimitError(e));
+    }
+    assert(threw);
+  },
+});
+```
+
+## The RateLimitError Type
+
+When `throws: true` is used, the error data follows this structure:
+
+```ts
+type RateLimitError = {
+  kind: "RateLimited";
+  name: string;        // The rate limit name
+  retryAfter: number;  // Milliseconds until retry could succeed
+};
+```
+
+## Using isRateLimitError Helper
+
+The library provides a type guard to check if an error is a rate limit error:
+
+```ts
+import { isRateLimitError } from "@convex-dev/rate-limiter";
+
+try {
+  await rateLimiter.limit(ctx, "sendMessage", { 
+    key: userId, 
+    throws: true 
+  });
+  
+  // Process the message
+  await ctx.db.insert("messages", { ... });
+  
+} catch (error) {
+  if (isRateLimitError(error)) {
+    // Handle rate limit error specifically
+    return { 
+      error: "Too many messages",
+      retryAfter: error.data.retryAfter,
+      limitName: error.data.name,
+    };
+  }
+  // Handle other errors
+  throw error;
+}
+```
+
+### Implementation
+
+From `src/client/index.ts:35-42`:
+
+```ts
+export function isRateLimitError(
+  error: unknown,
+): error is { data: RateLimitError } {
+  return (
+    error instanceof ConvexError &&
+    (error as any).data["kind"] === "RateLimited"
+  );
+}
+```
+
+## ConvexError Integration
+
+Rate limit errors are thrown as `ConvexError` instances, which means they:
+- Are automatically serialized and sent to the client
+- Include structured data that clients can parse
+- Work seamlessly with Convex's error handling
+
+```ts
+import { ConvexError } from "convex/values";
+
+try {
+  await rateLimiter.limit(ctx, "apiCall", { throws: true });
+} catch (error) {
+  if (error instanceof ConvexError && error.data.kind === "RateLimited") {
+    console.log(`Rate limited: ${error.data.name}`);
+    console.log(`Retry after: ${error.data.retryAfter}ms`);
+  }
+}
+```
+
+## Client-Side Error Handling
+
+When rate limit errors reach the client, you can handle them in your React components:
+
+```tsx
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+import { isRateLimitError } from "@convex-dev/rate-limiter";
+
+function ChatBox() {
+  const sendMessage = useMutation(api.messages.send);
+  const [error, setError] = useState<string | null>(null);
+  
+  const handleSend = async (text: string) => {
+    try {
+      await sendMessage({ text });
+      setError(null);
+    } catch (err) {
+      if (isRateLimitError(err)) {
+        const seconds = Math.ceil(err.data.retryAfter / 1000);
+        setError(`Too many messages. Wait ${seconds}s before trying again.`);
+      } else {
+        setError("Failed to send message");
+      }
+    }
+  };
+  
+  return (
+    <div>
+      {error && <div className="error">{error}</div>}
+      {/* ... */}
+    </div>
+  );
+}
+```
+
+## Choosing the Right Approach
+
+<Tabs>
+  <Tab title="Use throws: true when...">
+    ✅ **Use automatic errors when:**
+    - Rate limiting is a hard requirement (security, abuse prevention)
+    - You want concise code without explicit checks
+    - The operation should always fail when rate limited
+    - You're protecting against abuse (failed logins, spam)
+    
+    ```ts
+    // Concise and clear: this MUST be rate limited
+    await rateLimiter.limit(ctx, "failedLogins", { 
+      key: email,
+      throws: true,
+    });
+    ```
+  </Tab>
+  
+  <Tab title="Use manual handling when...">
+    ✅ **Use manual handling when:**
+    - You want to provide custom error messages
+    - You need to return structured error data
+    - The client needs specific retry information
+    - You want to degrade gracefully
+    
+    ```ts
+    // Custom error message and retry logic
+    const { ok, retryAfter } = await rateLimiter.limit(ctx, "export", { 
+      key: teamId,
+    });
+    
+    if (!ok) {
+      return {
+        status: "rate_limited",
+        message: "Export quota exceeded for your team",
+        retryAt: Date.now() + retryAfter!,
+        upgradeUrl: "/pricing",
+      };
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Combining Multiple Rate Limits
+
+You can combine multiple rate limits with different error handling strategies:
+
+```ts
+export const sendMessage = mutation({
+  args: { text: v.string() },
+  handler: async (ctx, args) => {
+    const userId = await getUserId(ctx);
+    
+    // Strict: Per-user message rate (throw on violation)
+    await rateLimiter.limit(ctx, "userMessages", {
+      key: userId,
+      throws: true,
+    });
+    
+    // Lenient: Global spam prevention (warn on violation)
+    const globalCheck = await rateLimiter.limit(ctx, "globalMessages");
+    if (!globalCheck.ok) {
+      console.warn("Global rate limit approaching capacity");
+      // Continue anyway
+    }
+    
+    await ctx.db.insert("messages", { text: args.text, userId });
+  },
+});
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Always handle rate limit errors on the client">
+    Even with `throws: true`, ensure your client code handles the error:
+    
+    ```tsx
+    try {
+      await mutation({ ... });
+    } catch (err) {
+      if (isRateLimitError(err)) {
+        // Show user-friendly message
+      }
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Provide helpful retry information">
+    Convert milliseconds to user-friendly units:
+    
+    ```ts
+    const seconds = Math.ceil(retryAfter / 1000);
+    const minutes = Math.ceil(retryAfter / 60000);
+    
+    if (retryAfter < 60000) {
+      return `Try again in ${seconds} seconds`;
+    } else {
+      return `Try again in ${minutes} minutes`;
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Log rate limit violations">
+    Monitor rate limit hits to detect abuse or adjust limits:
+    
+    ```ts
+    const { ok, retryAfter } = await rateLimiter.limit(ctx, "action", { key });
+    
+    if (!ok) {
+      console.warn(`Rate limit hit: ${key}, retry after ${retryAfter}ms`);
+      // Consider logging to analytics
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+- Learn about [Checking Limits](/usage/checking-limits) without consuming tokens
+- Understand [Resetting Limits](/usage/resetting-limits) after successful actions
+- Explore [Basic Usage](/usage/basic-usage) for getting started

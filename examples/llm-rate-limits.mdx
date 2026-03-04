@@ -1,0 +1,440 @@
+---
+title: "LLM API Rate Limiting"
+description: "Control AI API costs with token counting and sharding for high-throughput applications"
+---
+
+## The Problem
+
+LLM APIs like OpenAI have strict rate limits on both:
+- **Tokens per minute** (e.g., 40,000 TPM)
+- **Requests per minute** (e.g., 1,000 RPM)
+
+Exceeding these limits causes failures and impacts user experience. You need to enforce these limits in your application while maintaining high throughput.
+
+## Solution: Dual Rate Limits with Sharding
+
+Use **two separate rate limits** (tokens and requests) with **sharding** to handle high concurrency without database contention.
+
+## Configuration
+
+```ts convex/rateLimits.ts
+import { RateLimiter, MINUTE } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Track token consumption (40k tokens per minute)
+  llmTokens: {
+    kind: "token bucket",
+    rate: 40000,
+    period: MINUTE,
+    shards: 10, // Split into 10 shards for high throughput
+  },
+  // Track request count (1k requests per minute)
+  llmRequests: {
+    kind: "fixed window",
+    rate: 1000,
+    period: MINUTE,
+    shards: 10, // Match shard count
+  },
+});
+
+export { rateLimiter };
+```
+
+**Why sharding?** With many concurrent requests, sharding prevents database contention by distributing the load across multiple rate limit buckets while maintaining overall correctness.
+
+## Implementation
+
+### Basic Token Counting
+
+```ts convex/ai.ts
+import { v } from "convex/values";
+import { action } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { rateLimiter } from "./rateLimits";
+import OpenAI from "openai";
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+export const generateText = action({
+  args: {
+    prompt: v.string(),
+    maxTokens: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const maxTokens = args.maxTokens ?? 500;
+
+    // Estimate input tokens (rough approximation: 1 token ≈ 4 characters)
+    const estimatedInputTokens = Math.ceil(args.prompt.length / 4);
+    const totalEstimatedTokens = estimatedInputTokens + maxTokens;
+
+    // Check both rate limits before making the API call
+    const requestCheck = await ctx.runMutation(
+      internal.ai.checkRequestLimit,
+      {}
+    );
+    if (!requestCheck.ok) {
+      throw new Error(
+        `Request rate limit exceeded. Retry in ${Math.ceil(requestCheck.retryAfter! / 1000)}s`
+      );
+    }
+
+    const tokenCheck = await ctx.runMutation(
+      internal.ai.checkTokenLimit,
+      { tokens: totalEstimatedTokens }
+    );
+    if (!tokenCheck.ok) {
+      throw new Error(
+        `Token rate limit exceeded. Retry in ${Math.ceil(tokenCheck.retryAfter! / 1000)}s`
+      );
+    }
+
+    // Make the OpenAI API call
+    const response = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages: [{ role: "user", content: args.prompt }],
+      max_tokens: maxTokens,
+    });
+
+    // Record actual token usage
+    const actualTokens = response.usage?.total_tokens ?? totalEstimatedTokens;
+    await ctx.runMutation(internal.ai.recordUsage, {
+      tokens: actualTokens,
+    });
+
+    return {
+      text: response.choices[0].message.content,
+      tokensUsed: actualTokens,
+    };
+  },
+});
+```
+
+### Internal Mutations for Rate Limiting
+
+```ts convex/ai.ts
+import { internalMutation } from "./_generated/server";
+
+export const checkRequestLimit = internalMutation({
+  handler: async (ctx) => {
+    return rateLimiter.limit(ctx, "llmRequests");
+  },
+});
+
+export const checkTokenLimit = internalMutation({
+  args: { tokens: v.number() },
+  handler: async (ctx, args) => {
+    return rateLimiter.limit(ctx, "llmTokens", {
+      count: args.tokens,
+    });
+  },
+});
+
+export const recordUsage = internalMutation({
+  args: { tokens: v.number() },
+  handler: async (ctx, args) => {
+    // The actual consumption was already recorded in checkTokenLimit
+    // This could log usage to analytics if needed
+    await ctx.db.insert("llmUsage", {
+      tokens: args.tokens,
+      timestamp: Date.now(),
+    });
+  },
+});
+```
+
+### Advanced: Reservation Pattern
+
+For better throughput, use the reservation pattern to queue requests:
+
+```ts convex/ai.ts
+import { internalAction } from "./_generated/server";
+
+export const generateWithReservation = internalAction({
+  args: {
+    prompt: v.string(),
+    maxTokens: v.optional(v.number()),
+    skipCheck: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args) => {
+    if (!args.skipCheck) {
+      const maxTokens = args.maxTokens ?? 500;
+      const estimatedTokens = Math.ceil(args.prompt.length / 4) + maxTokens;
+
+      // Reserve capacity for both limits
+      const requestStatus = await ctx.runMutation(
+        internal.ai.reserveRequest,
+        {}
+      );
+      const tokenStatus = await ctx.runMutation(
+        internal.ai.reserveTokens,
+        { tokens: estimatedTokens }
+      );
+
+      // If either limit requires waiting, schedule for later
+      const maxRetryAfter = Math.max(
+        requestStatus.retryAfter ?? 0,
+        tokenStatus.retryAfter ?? 0
+      );
+
+      if (maxRetryAfter > 0) {
+        await ctx.scheduler.runAfter(
+          maxRetryAfter,
+          internal.ai.generateWithReservation,
+          {
+            ...args,
+            skipCheck: true, // Skip check since we reserved
+          }
+        );
+        return { queued: true, retryAfter: maxRetryAfter };
+      }
+    }
+
+    // Proceed with API call
+    const response = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages: [{ role: "user", content: args.prompt }],
+      max_tokens: args.maxTokens,
+    });
+
+    return {
+      text: response.choices[0].message.content,
+      tokensUsed: response.usage?.total_tokens,
+    };
+  },
+});
+
+export const reserveRequest = internalMutation({
+  handler: async (ctx) => {
+    return rateLimiter.limit(ctx, "llmRequests", { reserve: true });
+  },
+});
+
+export const reserveTokens = internalMutation({
+  args: { tokens: v.number() },
+  handler: async (ctx, args) => {
+    return rateLimiter.limit(ctx, "llmTokens", {
+      count: args.tokens,
+      reserve: true,
+    });
+  },
+});
+```
+
+## Accurate Token Counting
+
+For precise token counting, use a tokenizer library:
+
+```ts convex/ai.ts
+import { encode } from "gpt-tokenizer";
+
+export const generateWithAccurateCount = action({
+  args: { prompt: v.string() },
+  handler: async (ctx, args) => {
+    // Accurately count input tokens
+    const inputTokens = encode(args.prompt).length;
+    const maxOutputTokens = 500;
+    const totalTokens = inputTokens + maxOutputTokens;
+
+    // Check rate limits with accurate count
+    const status = await ctx.runMutation(internal.ai.checkTokenLimit, {
+      tokens: totalTokens,
+    });
+
+    if (!status.ok) {
+      throw new Error(`Rate limit exceeded`);
+    }
+
+    // Proceed with API call...
+  },
+});
+```
+
+Install the tokenizer:
+```bash
+npm install gpt-tokenizer
+```
+
+## Testing High Throughput
+
+```ts convex/test.ts
+import { internalMutation } from "./_generated/server";
+import { rateLimiter } from "./rateLimits";
+
+export const testLLMLimits = internalMutation({
+  handler: async (ctx) => {
+    let requestsSucceeded = 0;
+    let tokensConsumed = 0;
+
+    // Simulate high request volume
+    for (let i = 0; i < 1050; i++) {
+      const requestStatus = await rateLimiter.limit(ctx, "llmRequests");
+      const tokenStatus = await rateLimiter.limit(ctx, "llmTokens", {
+        count: 100, // 100 tokens per request
+      });
+
+      if (requestStatus.ok && tokenStatus.ok) {
+        requestsSucceeded++;
+        tokensConsumed += 100;
+      } else {
+        console.log(
+          `Request ${i + 1} blocked. ` +
+          `Requests: ${requestStatus.ok}, Tokens: ${tokenStatus.ok}`
+        );
+        break;
+      }
+    }
+
+    console.log(`Succeeded: ${requestsSucceeded} requests`);
+    console.log(`Consumed: ${tokensConsumed} tokens`);
+
+    // Should allow ~1000 requests and ~40000 tokens
+    if (requestsSucceeded < 900 || requestsSucceeded > 1000) {
+      throw new Error(`Expected ~1000 requests, got ${requestsSucceeded}`);
+    }
+
+    if (tokensConsumed < 36000 || tokensConsumed > 40000) {
+      throw new Error(`Expected ~40k tokens, got ${tokensConsumed}`);
+    }
+
+    console.log("✓ Rate limits working correctly with sharding");
+  },
+});
+```
+
+## Client-Side Usage
+
+```tsx src/AIChat.tsx
+import { useAction } from "convex/react";
+import { api } from "../convex/_generated/api";
+import { useState } from "react";
+
+export function AIChat() {
+  const generate = useAction(api.ai.generateText);
+  const [prompt, setPrompt] = useState("");
+  const [response, setResponse] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleGenerate = async () => {
+    setLoading(true);
+    setError("");
+
+    try {
+      const result = await generate({ prompt });
+      setResponse(result.text ?? "");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed";
+      setError(message);
+
+      // Show retry guidance for rate limits
+      if (message.includes("rate limit")) {
+        const match = message.match(/(\d+)s/);
+        if (match) {
+          setTimeout(() => {
+            setError("");
+          }, parseInt(match[1]) * 1000);
+        }
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div>
+      <textarea
+        value={prompt}
+        onChange={(e) => setPrompt(e.target.value)}
+        placeholder="Enter your prompt..."
+        rows={4}
+      />
+      <button onClick={handleGenerate} disabled={loading}>
+        {loading ? "Generating..." : "Generate"}
+      </button>
+      {error && <div className="error">{error}</div>}
+      {response && (
+        <div className="response">
+          <h3>Response:</h3>
+          <p>{response}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+## Common Variations
+
+<Tabs>
+  <Tab title="Per-User Limits">
+    ```ts
+    // Different limits for free vs paid users
+    const tier = await getUserTier(ctx, userId);
+    const tokenLimit = tier === "paid" ? "llmTokensPaid" : "llmTokensFree";
+
+    const status = await rateLimiter.limit(ctx, tokenLimit, {
+      key: userId,
+      count: tokens,
+    });
+    ```
+
+    Configure tiers:
+    ```ts
+    const rateLimiter = new RateLimiter(components.rateLimiter, {
+      llmTokensFree: { kind: "token bucket", rate: 10000, period: MINUTE },
+      llmTokensPaid: { kind: "token bucket", rate: 100000, period: MINUTE, shards: 10 },
+    });
+    ```
+  </Tab>
+  <Tab title="Multiple Models">
+    ```ts
+    // Different limits for different models
+    const model = args.model ?? "gpt-4";
+    const limitName = model.startsWith("gpt-4") 
+      ? "llmTokensGPT4" 
+      : "llmTokensGPT35";
+
+    await rateLimiter.limit(ctx, limitName, { count: tokens });
+    ```
+
+    Configure per model:
+    ```ts
+    llmTokensGPT4: { kind: "token bucket", rate: 40000, period: MINUTE, shards: 10 },
+    llmTokensGPT35: { kind: "token bucket", rate: 90000, period: MINUTE, shards: 10 },
+    ```
+  </Tab>
+  <Tab title="Cost Tracking">
+    ```ts
+    // Track both tokens and cost
+    const cost = calculateCost(tokens, model);
+    
+    await rateLimiter.limit(ctx, "llmTokens", { count: tokens });
+    await rateLimiter.limit(ctx, "llmCost", { 
+      count: Math.ceil(cost * 100), // Track cost in cents
+    });
+
+    function calculateCost(tokens: number, model: string): number {
+      const rates = {
+        "gpt-4": { input: 0.03 / 1000, output: 0.06 / 1000 },
+        "gpt-3.5-turbo": { input: 0.0015 / 1000, output: 0.002 / 1000 },
+      };
+      return tokens * (rates[model]?.input ?? 0.03 / 1000);
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+  **Sharding trade-off:** With 10 shards, each shard has 1/10th the capacity (4,000 tokens). The power-of-two selection helps balance load, but you may occasionally be rate limited when overall capacity exists. This is the trade-off for avoiding database contention.
+</Warning>
+
+<Note>
+  **Token estimation:** Always overestimate token counts when checking limits. It's better to reserve too many tokens than to exceed your LLM provider's limits and get throttled.
+</Note>
+
+<Tip>
+  Use the reservation pattern (`reserve: true`) for better throughput. It allows requests to queue automatically instead of failing, maximizing your API limit utilization.
+</Tip>

@@ -1,0 +1,294 @@
+---
+title: Utilities
+description: Utility functions for rate limiting
+---
+
+Utility functions for working with rate limits.
+
+## calculateRateLimit
+
+Calculate rate limit values based on the current state and configuration. This function is exported so it can be used in both client and server code.
+
+```typescript
+function calculateRateLimit(
+  existing: { value: number; ts: number } | null,
+  config: RateLimitConfig,
+  now: number = Date.now(),
+  count: number = 0,
+): {
+  value: number;
+  ts: number;
+  retryAfter: number | undefined;
+  windowStart: number | undefined;
+}
+```
+
+### Parameters
+
+<ParamField path="existing" type="{ value: number; ts: number } | null" required>
+  The existing rate limit state, or `null` if this is the first request.
+  
+  <Expandable title="Properties">
+    <ResponseField name="value" type="number" required>
+      The current number of available tokens
+    </ResponseField>
+    
+    <ResponseField name="ts" type="number" required>
+      The timestamp of the last update (in milliseconds)
+    </ResponseField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="config" type="RateLimitConfig" required>
+  The rate limit configuration. See [RateLimitConfig](/api/types#ratelimitconfig).
+</ParamField>
+
+<ParamField path="now" type="number" default="Date.now()">
+  The current time in milliseconds. Defaults to `Date.now()`.
+</ParamField>
+
+<ParamField path="count" type="number" default="0">
+  The number of tokens to consume. Defaults to 0 (just check, don't consume).
+</ParamField>
+
+### Returns
+
+An object containing the calculated rate limit state:
+
+<ResponseField name="value" type="number" required>
+  The number of tokens remaining after consuming `count` tokens
+</ResponseField>
+
+<ResponseField name="ts" type="number" required>
+  The updated timestamp for this state
+</ResponseField>
+
+<ResponseField name="retryAfter" type="number | undefined" required>
+  If the rate limit would be exceeded, this is the duration in milliseconds to wait before retrying. `undefined` if the request is allowed.
+</ResponseField>
+
+<ResponseField name="windowStart" type="number | undefined" required>
+  For fixed window rate limits, the start time of the current window. `undefined` for token bucket rate limits.
+</ResponseField>
+
+### Use Cases
+
+**Client-side prediction**: Calculate expected rate limit state before making a request
+
+```typescript
+import { calculateRateLimit, MINUTE } from "@convex-dev/rate-limiter";
+
+const config = {
+  kind: "token bucket",
+  rate: 10,
+  period: MINUTE,
+  capacity: 20
+};
+
+const existing = { value: 5, ts: Date.now() - 10000 };
+const result = calculateRateLimit(existing, config, Date.now(), 1);
+
+if (result.retryAfter) {
+  console.log(`Would be rate limited. Retry after ${result.retryAfter}ms`);
+} else {
+  console.log(`${result.value} tokens would remain`);
+}
+```
+
+**Testing**: Test rate limit logic without database access
+
+```typescript
+import { calculateRateLimit, SECOND } from "@convex-dev/rate-limiter";
+
+const config = {
+  kind: "fixed window",
+  rate: 5,
+  period: SECOND
+};
+
+// First request - no existing state
+const first = calculateRateLimit(null, config, 1000, 1);
+console.log(first.value); // 4 tokens remaining
+
+// Second request - use previous state
+const second = calculateRateLimit(
+  { value: first.value, ts: first.ts },
+  config,
+  1000,
+  5
+);
+console.log(second.retryAfter); // Will have a retry time since we'd exceed the limit
+```
+
+**Custom rate limiting logic**: Build custom rate limiting on top of the calculation
+
+```typescript
+function checkMultipleLimits(
+  configs: RateLimitConfig[],
+  states: Array<{ value: number; ts: number } | null>
+) {
+  const now = Date.now();
+  
+  for (let i = 0; i < configs.length; i++) {
+    const result = calculateRateLimit(states[i], configs[i], now, 1);
+    if (result.retryAfter) {
+      return { ok: false, retryAfter: result.retryAfter };
+    }
+  }
+  
+  return { ok: true };
+}
+```
+
+### Algorithm Details
+
+<Accordion title="Token Bucket Algorithm">
+  For token bucket rate limits:
+  
+  1. Calculate elapsed time since last update: `elapsed = now - state.ts`
+  2. Calculate token generation rate: `rate = config.rate / config.period`
+  3. Add generated tokens: `value = min(state.value + elapsed * rate, max) - count`
+  4. Update timestamp to current time: `ts = now`
+  5. If `value < 0`, calculate retry time: `retryAfter = -value / rate`
+</Accordion>
+
+<Accordion title="Fixed Window Algorithm">
+  For fixed window rate limits:
+  
+  1. Calculate elapsed windows: `elapsedWindows = floor((now - state.ts) / config.period)`
+  2. Add tokens from new windows: `value = min(state.value + rate * elapsedWindows, max) - count`
+  3. Update timestamp to start of current window: `ts = state.ts + elapsedWindows * config.period`
+  4. If `value < 0`, calculate windows needed and retry time
+</Accordion>
+
+---
+
+## isRateLimitError
+
+Type guard function to check if an error is a rate limit error.
+
+```typescript
+function isRateLimitError(
+  error: unknown,
+): error is { data: RateLimitError }
+```
+
+### Parameters
+
+<ParamField path="error" type="unknown" required>
+  The error to check
+</ParamField>
+
+### Returns
+
+`true` if the error is a `ConvexError` with `data.kind === "RateLimited"`, `false` otherwise.
+
+When `true`, TypeScript will narrow the type to `{ data: RateLimitError }`.
+
+### Use Cases
+
+**Error handling in mutations**: Handle rate limit errors differently from other errors
+
+```typescript
+import { isRateLimitError } from "@convex-dev/rate-limiter";
+import { mutation } from "./_generated/server";
+
+export const sendMessage = mutation({
+  args: { text: v.string() },
+  handler: async (ctx, args) => {
+    try {
+      await rateLimiter.limit(ctx, "sendMessage", {
+        key: ctx.userId,
+        throws: true
+      });
+      
+      // Send the message
+      await ctx.db.insert("messages", { text: args.text });
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        console.log(`User ${ctx.userId} rate limited on ${error.data.name}`);
+        console.log(`Retry after ${error.data.retryAfter}ms`);
+        throw error;
+      }
+      // Handle other errors
+      throw error;
+    }
+  }
+});
+```
+
+**Client-side error handling**: Show user-friendly messages for rate limit errors
+
+```typescript
+import { useMutation } from "convex/react";
+import { api } from "./convex/_generated/api";
+import { isRateLimitError } from "@convex-dev/rate-limiter";
+
+function MessageForm() {
+  const sendMessage = useMutation(api.messages.sendMessage);
+  
+  const handleSubmit = async (text: string) => {
+    try {
+      await sendMessage({ text });
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        const retrySeconds = Math.ceil(error.data.retryAfter / 1000);
+        alert(`Rate limited. Please wait ${retrySeconds} seconds.`);
+      } else {
+        alert("An error occurred");
+      }
+    }
+  };
+  
+  // ... rest of component
+}
+```
+
+**Logging and monitoring**: Track rate limit events separately
+
+```typescript
+import { isRateLimitError } from "@convex-dev/rate-limiter";
+
+try {
+  await rateLimiter.limit(ctx, "apiCall", { key: apiKey, throws: true });
+  // ... handle request
+} catch (error) {
+  if (isRateLimitError(error)) {
+    // Log to analytics
+    await ctx.db.insert("rateLimitEvents", {
+      name: error.data.name,
+      retryAfter: error.data.retryAfter,
+      timestamp: Date.now()
+    });
+  }
+  throw error;
+}
+```
+
+**Automatic retry logic**: Implement exponential backoff for rate-limited requests
+
+```typescript
+import { isRateLimitError } from "@convex-dev/rate-limiter";
+
+async function callWithRetry(fn: () => Promise<void>, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      await fn();
+      return;
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        const delay = error.data.retryAfter;
+        console.log(`Rate limited, waiting ${delay}ms before retry ${i + 1}/${maxRetries}`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error("Max retries exceeded");
+}
+```
+
+<Note>
+  The `isRateLimitError` function checks for errors thrown when using `throws: true` in rate limit operations. If you're not using `throws: true`, check the `ok` field in the return value instead.
+</Note>

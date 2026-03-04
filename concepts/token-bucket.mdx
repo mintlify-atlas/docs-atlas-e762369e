@@ -1,0 +1,344 @@
+---
+title: "Token Bucket Algorithm"
+description: "Deep dive into the token bucket rate limiting strategy"
+---
+
+## Overview
+
+The token bucket algorithm limits requests by continuously adding tokens to a bucket at a fixed rate. Each request consumes tokens, and requests are denied when insufficient tokens are available.
+
+<Info>
+A token bucket limits the rate of requests by continuously adding tokens to be consumed when servicing requests. The `rate` is the number of tokens added per `period`. The `capacity` is the maximum number of tokens that can accumulate.
+</Info>
+
+## How It Works
+
+### Continuous Token Addition
+
+Unlike fixed window, tokens are added **continuously** rather than in bulk:
+
+1. Tokens are added at a rate of `rate / period` tokens per millisecond
+2. The bucket can hold up to `capacity` tokens (defaults to `rate`)
+3. When a request arrives, the system:
+   - Calculates how many tokens have been added since the last request
+   - Adds those tokens to the current value (up to capacity)
+   - Attempts to consume the requested number of tokens
+
+### Capacity and Rollover
+
+The `capacity` parameter controls how many tokens can accumulate:
+
+- **When capacity equals rate**: No burst allowance, strict rate limiting
+- **When capacity exceeds rate**: Allows bursts if user has been inactive
+
+```typescript
+// Strict rate limiting - no burst
+{
+  kind: "token bucket",
+  rate: 10,
+  period: MINUTE,
+  capacity: 10,  // Same as rate
+}
+
+// Burst allowance - up to 20 messages if user was inactive
+{
+  kind: "token bucket",
+  rate: 10,
+  period: MINUTE,
+  capacity: 20,  // Double the rate
+}
+```
+
+## Visual Explanation
+
+Here's how tokens accumulate over time:
+
+```
+Capacity: 20 tokens
+Rate: 10 tokens/minute (0.167 tokens/second)
+
+Time    Tokens  Action
+0s      20      (full capacity)
+1s      20      User sends 5 messages → 15 tokens remain
+5s      15.67   Tokens added: 4s × 0.167 = 0.67
+10s     16.5    Tokens added: 5s × 0.167 = 0.83
+60s     20      Refilled to capacity (can't exceed 20)
+```
+
+<Note>
+Tokens are added continuously based on elapsed time, not in discrete intervals. This provides the smoothest possible rate limiting.
+</Note>
+
+## Configuration
+
+### Type Definition
+
+From `src/shared.ts`:
+
+```typescript
+export const tokenBucketValidator = v.object({
+  kind: v.literal("token bucket"),
+  rate: v.number(),
+  period: v.number(),
+  capacity: v.optional(v.number()),
+  maxReserved: v.optional(v.number()),
+  shards: v.optional(v.number()),
+  start: v.optional(v.null()),  // Always null for token bucket
+});
+```
+
+### Parameters
+
+#### `rate` (required)
+
+The number of tokens added per `period`.
+
+```typescript
+{ rate: 10 }  // 10 tokens per period
+```
+
+#### `period` (required)
+
+The time period in milliseconds. Use the provided constants:
+
+```typescript
+import { SECOND, MINUTE, HOUR, DAY } from "@convex-dev/rate-limiter";
+
+{ period: MINUTE }  // 60,000 milliseconds
+```
+
+#### `capacity` (optional)
+
+Maximum tokens that can accumulate. Defaults to `rate`.
+
+```typescript
+{
+  rate: 10,
+  period: MINUTE,
+  capacity: 30,  // Can accumulate up to 30 tokens
+}
+```
+
+#### `maxReserved` (optional)
+
+Maximum tokens that can be reserved into the future.
+
+```typescript
+{
+  rate: 100,
+  period: MINUTE,
+  maxReserved: 50,  // Can reserve up to 50 tokens ahead
+}
+```
+
+#### `shards` (optional)
+
+Number of shards for high-throughput scenarios. See [Scaling with Shards](/advanced/sharding).
+
+```typescript
+{
+  rate: 40000,
+  period: MINUTE,
+  shards: 10,  // Split across 10 shards
+}
+```
+
+## Real Code Examples
+
+### Basic Message Rate Limiting
+
+```typescript
+import { RateLimiter, MINUTE } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Allow one message every ~6 seconds (10 per minute)
+  // Allows up to 3 in quick succession if they haven't sent many recently
+  sendMessage: {
+    kind: "token bucket",
+    rate: 10,
+    period: MINUTE,
+    capacity: 3,
+  },
+});
+
+// In your mutation:
+export const sendMessage = mutation({
+  args: { text: v.string() },
+  handler: async (ctx, args) => {
+    const userId = await getCurrentUser(ctx);
+    const { ok, retryAfter } = await rateLimiter.limit(
+      ctx,
+      "sendMessage",
+      { key: userId }
+    );
+
+    if (!ok) {
+      throw new Error(`Rate limited. Retry in ${retryAfter}ms`);
+    }
+
+    // Send the message...
+  },
+});
+```
+
+### LLM API Rate Limiting
+
+```typescript
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // LLM APIs often have token-based limits
+  llmTokens: {
+    kind: "token bucket",
+    rate: 40000,      // 40k tokens per minute
+    period: MINUTE,
+    shards: 10,       // High throughput
+  },
+});
+
+export const generateText = mutation({
+  args: { prompt: v.string() },
+  handler: async (ctx, args) => {
+    const estimatedTokens = args.prompt.length / 4;  // Rough estimate
+
+    const { ok, retryAfter } = await rateLimiter.limit(
+      ctx,
+      "llmTokens",
+      { count: estimatedTokens }  // Consume multiple tokens
+    );
+
+    if (!ok) {
+      throw new Error(`Rate limited. Retry in ${retryAfter}ms`);
+    }
+
+    // Call LLM API...
+  },
+});
+```
+
+### Failed Login Attempts
+
+```typescript
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  failedLogins: {
+    kind: "token bucket",
+    rate: 10,
+    period: HOUR,
+  },
+});
+
+export const login = mutation({
+  args: { email: v.string(), password: v.string() },
+  handler: async (ctx, args) => {
+    const user = await getUserByEmail(ctx, args.email);
+
+    if (!user || !verifyPassword(args.password, user.passwordHash)) {
+      // Rate limit failed login attempts
+      await rateLimiter.limit(
+        ctx,
+        "failedLogins",
+        { key: args.email, throws: true }
+      );
+      throw new Error("Invalid credentials");
+    }
+
+    // Reset on successful login
+    await rateLimiter.reset(ctx, "failedLogins", { key: args.email });
+
+    // Create session...
+  },
+});
+```
+
+## Implementation Details
+
+The token bucket calculation from `src/shared.ts`:
+
+```typescript
+if (config.kind === "token bucket") {
+  const elapsed = now - state.ts;
+  const rate = config.rate / config.period;
+  value = Math.min(state.value + elapsed * rate, max) - count;
+  ts = now;
+  if (value < 0) {
+    retryAfter = -value / rate;
+  }
+}
+```
+
+Key points:
+- `elapsed`: Time since last update in milliseconds
+- `rate`: Tokens per millisecond (rate / period)
+- New value: Previous value + (elapsed × rate), capped at capacity
+- `retryAfter`: Calculated as the time needed to accumulate missing tokens
+
+## Use Cases
+
+### Smooth Rate Limiting
+
+Token bucket is ideal when you want the smoothest possible rate limiting without sudden boundaries:
+
+```typescript
+// Smooth API calls - tokens constantly replenishing
+{
+  kind: "token bucket",
+  rate: 100,
+  period: MINUTE,
+}
+```
+
+### LLM and Streaming APIs
+
+Many LLM APIs (OpenAI, Anthropic) use token-based limits:
+
+```typescript
+{
+  kind: "token bucket",
+  rate: 40000,      // Tokens per minute
+  period: MINUTE,
+  capacity: 60000,  // Allow some burst capacity
+}
+```
+
+### User Actions with Burst Allowance
+
+Allow users to perform bursts of actions if they've been inactive:
+
+```typescript
+// Allow 10 per minute, but up to 20 if user was inactive
+{
+  kind: "token bucket",
+  rate: 10,
+  period: MINUTE,
+  capacity: 20,
+}
+```
+
+## Advantages
+
+- **Smoothest rate limiting**: Tokens added continuously, not in chunks
+- **Flexible burst handling**: Capacity can be tuned independently of rate
+- **Fair to bursty traffic**: Inactive users accumulate tokens for later use
+- **Works well with reservations**: Can calculate exact retry times
+
+## Limitations
+
+- **No predictable resets**: Tokens are always being added, no fixed "reset time"
+- **Less intuitive**: "10 per minute" doesn't mean "10 at the start of each minute"
+- **Requires calculation**: Token count must be calculated on every check
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Fixed Window" icon="window" href="/concepts/fixed-window">
+    Learn about the alternative fixed window strategy
+  </Card>
+  <Card title="Basic Usage" icon="code" href="/usage/basic-usage">
+    Start using token bucket rate limiting
+  </Card>
+  <Card title="Scaling with Shards" icon="server" href="/advanced/sharding">
+    Handle high throughput scenarios
+  </Card>
+  <Card title="Reservations" icon="calendar-check" href="/advanced/reservations">
+    Reserve capacity ahead of time
+  </Card>
+</CardGroup>

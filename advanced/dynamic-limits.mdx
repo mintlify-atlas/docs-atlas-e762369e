@@ -1,0 +1,415 @@
+---
+title: Dynamic Rate Limits
+description: Define rate limits at runtime with the config parameter
+---
+
+## Overview
+
+While most rate limits are defined statically in the `RateLimiter` constructor, you can also define them dynamically at runtime using the `config` parameter.
+
+## Static vs Dynamic Definitions
+
+### Static Definition (Recommended)
+
+Define rate limits in the constructor for type safety:
+
+```ts
+import { RateLimiter, MINUTE, HOUR } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  sendMessage: { kind: "token bucket", rate: 10, period: MINUTE },
+  freeTrialSignUp: { kind: "fixed window", rate: 100, period: HOUR },
+});
+
+// Usage: TypeScript knows about these names
+await rateLimiter.limit(ctx, "sendMessage"); // ✓ Type-safe
+await rateLimiter.limit(ctx, "typo"); // ✗ Type error
+```
+
+### Dynamic Definition
+
+Define rate limits inline when calling `limit()`:
+
+```ts
+const config = { kind: "fixed window", rate: 1, period: SECOND };
+const status = await rateLimiter.limit(ctx, "oneOffName", { config });
+```
+
+## When to Use Dynamic Limits
+
+### 1. One-Off Rate Limits
+
+For rarely-used rate limits that don't warrant a static definition:
+
+```ts
+export const specialOperation = mutation({
+  handler: async (ctx) => {
+    // One-time rate limit for this specific operation
+    const config = { kind: "token bucket", rate: 5, period: MINUTE };
+    const status = await rateLimiter.limit(ctx, "specialOp", { config });
+    
+    if (!status.ok) {
+      throw new Error("Rate limited");
+    }
+    
+    // Perform operation
+  },
+});
+```
+
+### 2. User-Specific Limits
+
+Different rate limits based on user tier or subscription:
+
+```ts
+export const processRequest = mutation({
+  args: { userId: v.id("users") },
+  handler: async (ctx, args) => {
+    // Get user's tier from database
+    const user = await ctx.db.get(args.userId);
+    
+    // Different limits per tier
+    const config = user.tier === "premium"
+      ? { kind: "token bucket", rate: 1000, period: HOUR }
+      : { kind: "token bucket", rate: 100, period: HOUR };
+    
+    const status = await rateLimiter.limit(ctx, "apiRequests", {
+      key: args.userId,
+      config,
+    });
+    
+    if (!status.ok) {
+      throw new Error(`Rate limited. Retry after ${status.retryAfter}ms`);
+    }
+    
+    // Process the request
+  },
+});
+```
+
+### 3. Configuration from Database
+
+Rate limits stored in your database:
+
+```ts
+export const executeAction = mutation({
+  args: { actionType: v.string() },
+  handler: async (ctx, args) => {
+    // Fetch rate limit config from database
+    const configDoc = await ctx.db
+      .query("rateLimitConfigs")
+      .withIndex("by_action", (q) => q.eq("actionType", args.actionType))
+      .first();
+    
+    if (!configDoc) {
+      throw new Error("No rate limit configured for this action");
+    }
+    
+    const config = {
+      kind: configDoc.kind,
+      rate: configDoc.rate,
+      period: configDoc.period,
+    } as RateLimitConfig;
+    
+    const status = await rateLimiter.limit(ctx, args.actionType, { config });
+    
+    if (!status.ok) {
+      throw new Error("Rate limited");
+    }
+    
+    // Execute the action
+  },
+});
+```
+
+### 4. Time-Based Limits
+
+Different limits during peak vs off-peak hours:
+
+```ts
+import { HOUR } from "@convex-dev/rate-limiter";
+
+function getRateLimitConfig() {
+  const hour = new Date().getUTCHours();
+  const isPeakHours = hour >= 9 && hour <= 17; // 9 AM - 5 PM UTC
+  
+  return isPeakHours
+    ? { kind: "token bucket", rate: 50, period: HOUR }   // Stricter during peak
+    : { kind: "token bucket", rate: 200, period: HOUR }; // Relaxed off-peak
+}
+
+export const processJob = mutation({
+  handler: async (ctx) => {
+    const config = getRateLimitConfig();
+    const status = await rateLimiter.limit(ctx, "backgroundJobs", { config });
+    
+    if (!status.ok) {
+      throw new Error("Rate limited");
+    }
+    
+    // Process the job
+  },
+});
+```
+
+### 5. A/B Testing Rate Limits
+
+Test different rate limit configurations:
+
+```ts
+export const experimentalFeature = mutation({
+  args: { userId: v.id("users") },
+  handler: async (ctx, args) => {
+    const user = await ctx.db.get(args.userId);
+    
+    // A/B test: different rate limits for different cohorts
+    const config = user.experimentCohort === "A"
+      ? { kind: "token bucket", rate: 10, period: MINUTE }
+      : { kind: "token bucket", rate: 20, period: MINUTE };
+    
+    const status = await rateLimiter.limit(ctx, "experimentalFeature", {
+      key: args.userId,
+      config,
+    });
+    
+    if (!status.ok) {
+      throw new Error("Rate limited");
+    }
+    
+    // Execute feature
+  },
+});
+```
+
+## Type Safety with Dynamic Limits
+
+When using dynamic configs, TypeScript requires the config parameter:
+
+```ts
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  knownLimit: { kind: "token bucket", rate: 10, period: MINUTE },
+});
+
+// Known limit: config is optional
+await rateLimiter.limit(ctx, "knownLimit"); // ✓
+
+// Unknown limit: config is required
+await rateLimiter.limit(ctx, "unknownLimit"); // ✗ Type error
+await rateLimiter.limit(ctx, "unknownLimit", { config }); // ✓
+```
+
+From the source (`client/index.ts:307-322`):
+
+```ts
+type WithKnownNameOrInlinedConfig<
+  Limits extends Record<string, RateLimitConfig>,
+  Name extends string,
+  Args,
+> = Expand<
+  Omit<Args, "name" | "config"> &
+    (Name extends keyof Limits
+      ? object
+      : {
+          config: RateLimitConfig;
+        })
+>;
+```
+
+## Combining Static and Dynamic
+
+You can override static configs with dynamic ones:
+
+```ts
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  apiCalls: { kind: "token bucket", rate: 100, period: HOUR },
+});
+
+export const specialCase = mutation({
+  handler: async (ctx) => {
+    // Override the static config for this specific case
+    const config = { kind: "token bucket", rate: 200, period: HOUR };
+    const status = await rateLimiter.limit(ctx, "apiCalls", { config });
+    
+    // This uses the overridden config, not the static one
+  },
+});
+```
+
+<Warning>
+  **Warning**: Overriding a static config can be confusing. Consider using a different name for truly different rate limits.
+</Warning>
+
+## Pattern: Rate Limit Factory
+
+Create reusable rate limit configurations:
+
+```ts
+import { RateLimitConfig, MINUTE, HOUR } from "@convex-dev/rate-limiter";
+
+class RateLimitFactory {
+  static forTier(tier: "free" | "basic" | "premium"): RateLimitConfig {
+    switch (tier) {
+      case "free":
+        return { kind: "token bucket", rate: 10, period: HOUR };
+      case "basic":
+        return { kind: "token bucket", rate: 100, period: HOUR };
+      case "premium":
+        return { kind: "token bucket", rate: 1000, period: HOUR };
+    }
+  }
+  
+  static forResourceType(resource: string): RateLimitConfig {
+    if (resource === "compute-intensive") {
+      return { kind: "token bucket", rate: 5, period: MINUTE };
+    }
+    return { kind: "token bucket", rate: 60, period: MINUTE };
+  }
+}
+
+export const executeTask = mutation({
+  args: {
+    userId: v.id("users"),
+    resourceType: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const user = await ctx.db.get(args.userId);
+    const config = RateLimitFactory.forTier(user.tier);
+    
+    const status = await rateLimiter.limit(ctx, "taskExecution", {
+      key: args.userId,
+      config,
+    });
+    
+    if (!status.ok) {
+      throw new Error("Rate limited");
+    }
+    
+    // Execute task
+  },
+});
+```
+
+## Dynamic Limits with React Hooks
+
+You can also use dynamic configs with the `useRateLimit` hook:
+
+```tsx
+import { useRateLimit } from "@convex-dev/rate-limiter/react";
+import { api } from "../convex/_generated/api";
+
+function DynamicRateLimitButton({ tier }: { tier: string }) {
+  const config = tier === "premium"
+    ? { kind: "token bucket", rate: 1000, period: 3600000 }
+    : { kind: "token bucket", rate: 100, period: 3600000 };
+  
+  const { status } = useRateLimit(api.rateLimit.getRateLimit, {
+    config,
+    getServerTimeMutation: api.rateLimit.getServerTime,
+  });
+
+  return (
+    <button disabled={!status?.ok}>
+      {status?.ok ? "Execute" : "Rate limited"}
+    </button>
+  );
+}
+```
+
+## Best Practices
+
+1. **Prefer static definitions**: Use the constructor for most rate limits
+2. **Document dynamic configs**: Comment why a dynamic config is needed
+3. **Validate dynamic configs**: Ensure rate/period values are reasonable
+4. **Cache configs**: Don't recalculate on every request if possible
+5. **Consider maintenance**: Dynamic configs are harder to audit and update
+
+## Validation Example
+
+```ts
+function validateRateLimitConfig(config: RateLimitConfig): void {
+  if (config.rate <= 0) {
+    throw new Error("Rate must be positive");
+  }
+  if (config.period <= 0) {
+    throw new Error("Period must be positive");
+  }
+  if (config.capacity !== undefined && config.capacity < config.rate) {
+    throw new Error("Capacity must be at least as large as rate");
+  }
+}
+
+export const dynamicLimit = mutation({
+  args: {
+    rate: v.number(),
+    period: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const config = {
+      kind: "token bucket" as const,
+      rate: args.rate,
+      period: args.period,
+    };
+    
+    // Validate before using
+    validateRateLimitConfig(config);
+    
+    const status = await rateLimiter.limit(ctx, "customLimit", { config });
+    
+    if (!status.ok) {
+      throw new Error("Rate limited");
+    }
+    
+    // Process request
+  },
+});
+```
+
+## When NOT to Use Dynamic Limits
+
+<Warning>
+  Avoid dynamic limits when:
+  - The rate limit is used frequently (define it statically)
+  - You need strong type safety
+  - The configuration rarely changes
+  - Multiple parts of your code use the same limit
+</Warning>
+
+## Performance Considerations
+
+Dynamic configs have minimal overhead, but:
+
+1. **Database lookups add latency**: Fetching configs from the database takes time
+2. **No caching by default**: Each request recalculates the config
+3. **Type checking is runtime**: TypeScript can't validate dynamic configs at compile time
+
+Consider caching frequently-used dynamic configs:
+
+```ts
+const configCache = new Map<string, RateLimitConfig>();
+
+export const cachedDynamicLimit = mutation({
+  args: { userId: v.id("users") },
+  handler: async (ctx, args) => {
+    // Check cache first
+    let config = configCache.get(args.userId);
+    
+    if (!config) {
+      const user = await ctx.db.get(args.userId);
+      config = getTierConfig(user.tier);
+      configCache.set(args.userId, config);
+    }
+    
+    const status = await rateLimiter.limit(ctx, "requests", {
+      key: args.userId,
+      config,
+    });
+    
+    // ...
+  },
+});
+```
+
+<Note>
+  For more advanced patterns, see [Sharding](/advanced/sharding) for high-throughput scenarios and [Reservations](/advanced/reservations) for preventing starvation.
+</Note>

@@ -1,0 +1,475 @@
+---
+title: "Fixed Window Algorithm"
+description: "Deep dive into the fixed window rate limiting strategy"
+---
+
+## Overview
+
+The fixed window algorithm limits requests by granting a fixed number of tokens at the start of each time window. Tokens accumulate up to a maximum capacity and are consumed by requests.
+
+<Info>
+A fixed window rate limit grants tokens in bulk at the start of each fixed window of time. The `rate` determines how many tokens are granted, the `period` defines the window duration, and `capacity` sets the maximum tokens that can accumulate.
+</Info>
+
+## How It Works
+
+### Token Grants at Window Boundaries
+
+Tokens are granted all at once when windows reset:
+
+1. Windows are defined by a `start` time and `period` duration
+2. At the start of each window, `rate` tokens are added (up to `capacity`)
+3. Requests consume tokens immediately
+4. When the window ends, a new window begins and tokens are added again
+
+### Start Time Configuration
+
+The `start` parameter determines when windows begin:
+
+- **Specified start**: All windows align to this timestamp
+- **Random start** (default): Randomly chosen between 0 and `period` to distribute load
+
+```typescript
+// Reset at midnight UTC every day
+{
+  kind: "fixed window",
+  rate: 1000,
+  period: DAY,
+  start: Date.UTC(2024, 0, 1, 0, 0, 0),  // Jan 1, 2024 00:00:00 UTC
+}
+
+// Random start to avoid thundering herd
+{
+  kind: "fixed window",
+  rate: 100,
+  period: HOUR,
+  // start not provided - will be random
+}
+```
+
+<Warning>
+Without a specified `start`, each rate limit instance will have a random window start to prevent all clients from flooding requests at the same time (avoiding thundering herd problems).
+</Warning>
+
+## Visual Explanation
+
+Here's how tokens are granted over time:
+
+```
+Rate: 100 tokens per hour
+Capacity: 150 tokens
+Start: 00:00:00
+
+Time     Window  Tokens  Action
+00:00    1       100     Window starts, 100 tokens granted
+00:15    1       100     User consumes 0 tokens
+00:30    1       85      User consumes 15 tokens
+00:45    1       70      User consumes 15 tokens
+01:00    2       170     New window! 100 tokens added (70 + 100)
+01:00    2       150     Capped at capacity of 150
+01:30    2       120     User consumes 30 tokens
+02:00    3       220     New window! 100 tokens added (120 + 100)
+02:00    3       150     Capped at capacity again
+```
+
+<Note>
+Tokens are granted in bulk at window boundaries. Between windows, tokens can only decrease (be consumed), never increase.
+</Note>
+
+## Configuration
+
+### Type Definition
+
+From `src/shared.ts`:
+
+```typescript
+export const fixedWindowValidator = v.object({
+  kind: v.literal("fixed window"),
+  rate: v.number(),
+  period: v.number(),
+  capacity: v.optional(v.number()),
+  maxReserved: v.optional(v.number()),
+  shards: v.optional(v.number()),
+  start: v.optional(v.number()),
+});
+```
+
+### Parameters
+
+#### `rate` (required)
+
+The number of tokens granted at the start of each window.
+
+```typescript
+{ rate: 100 }  // Grant 100 tokens per window
+```
+
+#### `period` (required)
+
+The window duration in milliseconds. Use the provided constants:
+
+```typescript
+import { SECOND, MINUTE, HOUR, DAY, WEEK } from "@convex-dev/rate-limiter";
+
+{ period: HOUR }  // 3,600,000 milliseconds
+```
+
+#### `capacity` (optional)
+
+Maximum tokens that can accumulate. Defaults to `rate`.
+
+```typescript
+{
+  rate: 100,
+  period: HOUR,
+  capacity: 150,  // Can accumulate up to 150 tokens
+}
+```
+
+#### `start` (optional)
+
+Timestamp in UTC milliseconds for when windows start. If not provided, a random time is chosen.
+
+```typescript
+// Align to midnight UTC
+{
+  kind: "fixed window",
+  rate: 1000,
+  period: DAY,
+  start: Date.UTC(2024, 0, 1, 0, 0, 0),
+}
+
+// Align to 9 AM Pacific Time (5 PM UTC)
+{
+  kind: "fixed window",
+  rate: 500,
+  period: DAY,
+  start: Date.UTC(2024, 0, 1, 17, 0, 0),
+}
+```
+
+#### `maxReserved` (optional)
+
+Maximum tokens that can be reserved into the future.
+
+```typescript
+{
+  rate: 1000,
+  period: MINUTE,
+  maxReserved: 200,  // Can reserve up to 200 tokens ahead
+}
+```
+
+#### `shards` (optional)
+
+Number of shards for high-throughput scenarios. See [Scaling with Shards](/advanced/sharding).
+
+```typescript
+{
+  rate: 1000,
+  period: MINUTE,
+  shards: 10,  // Split across 10 shards
+}
+```
+
+## Real Code Examples
+
+### Free Trial Signups
+
+```typescript
+import { RateLimiter, HOUR } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Limit free trial signups to deter bots
+  freeTrialSignUp: {
+    kind: "fixed window",
+    rate: 100,
+    period: HOUR,
+  },
+});
+
+export const signUp = mutation({
+  args: { email: v.string() },
+  handler: async (ctx, args) => {
+    // Global rate limit (no key - shared across all users)
+    const { ok, retryAfter } = await rateLimiter.limit(
+      ctx,
+      "freeTrialSignUp"
+    );
+
+    if (!ok) {
+      throw new Error(
+        `Too many signups. Try again in ${Math.ceil(retryAfter / 1000)}s`
+      );
+    }
+
+    // Create user account...
+  },
+});
+```
+
+### Daily API Quota
+
+```typescript
+import { DAY } from "@convex-dev/rate-limiter";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  dailyApiCalls: {
+    kind: "fixed window",
+    rate: 1000,
+    period: DAY,
+    start: Date.UTC(2024, 0, 1, 0, 0, 0),  // Midnight UTC
+  },
+});
+
+export const apiCall = mutation({
+  args: { /* ... */ },
+  handler: async (ctx, args) => {
+    const apiKey = await getApiKey(ctx);
+
+    const { ok, retryAfter } = await rateLimiter.limit(
+      ctx,
+      "dailyApiCalls",
+      { key: apiKey }
+    );
+
+    if (!ok) {
+      const hours = Math.ceil(retryAfter / (1000 * 60 * 60));
+      throw new Error(`Daily quota exceeded. Resets in ${hours}h`);
+    }
+
+    // Process API request...
+  },
+});
+```
+
+### High-Throughput LLM Requests
+
+```typescript
+import { MINUTE } from "@convex-dev/rate-limiter";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  llmRequests: {
+    kind: "fixed window",
+    rate: 1000,
+    period: MINUTE,
+    shards: 10,  // Handle high concurrency
+  },
+});
+
+export const generateText = mutation({
+  args: { prompt: v.string() },
+  handler: async (ctx, args) => {
+    await rateLimiter.limit(
+      ctx,
+      "llmRequests",
+      { throws: true }  // Automatically throw on rate limit
+    );
+
+    // Call LLM API...
+  },
+});
+```
+
+### Per-User Hourly Limits
+
+```typescript
+import { HOUR } from "@convex-dev/rate-limiter";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  userActions: {
+    kind: "fixed window",
+    rate: 100,
+    period: HOUR,
+    capacity: 120,  // Allow 20 token rollover
+  },
+});
+
+export const performAction = mutation({
+  args: { /* ... */ },
+  handler: async (ctx, args) => {
+    const userId = await getCurrentUser(ctx);
+
+    const { ok, retryAfter } = await rateLimiter.limit(
+      ctx,
+      "userActions",
+      { key: userId }
+    );
+
+    if (!ok) {
+      const minutes = Math.ceil(retryAfter / (1000 * 60));
+      throw new Error(`Rate limited. Try again in ${minutes} minutes`);
+    }
+
+    // Perform action...
+  },
+});
+```
+
+## Implementation Details
+
+The fixed window calculation from `src/shared.ts`:
+
+```typescript
+if (config.kind === "fixed window") {
+  windowStart = state.ts;
+  const elapsedWindows = Math.floor((now - state.ts) / config.period);
+  const rate = config.rate;
+  value = Math.min(state.value + rate * elapsedWindows, max) - count;
+  ts = state.ts + elapsedWindows * config.period;
+  if (value < 0) {
+    const windowsNeeded = Math.ceil(-value / rate);
+    retryAfter = ts + config.period * windowsNeeded - now;
+  }
+}
+```
+
+Key points:
+- `elapsedWindows`: Number of complete windows since last update
+- Tokens added: `rate × elapsedWindows`, capped at capacity
+- `ts` updated to the start of the current window
+- `retryAfter`: Time until enough windows pass to have sufficient tokens
+
+## Use Cases
+
+### Scheduled Resets
+
+When you want quotas to reset at specific times:
+
+```typescript
+// Daily quota that resets at midnight
+{
+  kind: "fixed window",
+  rate: 1000,
+  period: DAY,
+  start: Date.UTC(2024, 0, 1, 0, 0, 0),
+}
+```
+
+### Burst Allowance
+
+Allow users to consume their entire quota in a burst:
+
+```typescript
+// 100 requests per hour, can use all 100 immediately
+{
+  kind: "fixed window",
+  rate: 100,
+  period: HOUR,
+}
+```
+
+### External API Alignment
+
+Match external API rate limit windows:
+
+```typescript
+// If your API provider resets limits every hour on the hour
+{
+  kind: "fixed window",
+  rate: 1000,
+  period: HOUR,
+  start: Date.UTC(2024, 0, 1, 0, 0, 0),
+}
+```
+
+### Global Singleton Limits
+
+Limit total system-wide actions:
+
+```typescript
+// Maximum 100 free trial signups per hour, shared globally
+{
+  kind: "fixed window",
+  rate: 100,
+  period: HOUR,
+}
+
+// Usage (no key - global limit)
+await rateLimiter.limit(ctx, "freeTrialSignUp");
+```
+
+## Advantages
+
+- **Predictable resets**: Users know exactly when their quota refreshes
+- **Simple to understand**: "100 per hour" means exactly that
+- **Burst-friendly**: Users can consume their entire quota immediately
+- **Aligned windows**: Multiple users share the same window boundaries
+
+## Limitations
+
+- **Boundary bursts**: Users can consume 2× rate at window boundaries
+  - Example: Use 100 at 11:59 AM, then 100 more at 12:00 PM
+- **Less smooth**: Token availability changes in steps, not continuously
+- **Thundering herd**: Without random start, all users retry at the same time
+
+<Warning>
+Fixed window can allow up to 2× the rate at window boundaries. If this is a concern, consider using token bucket instead.
+</Warning>
+
+## Avoiding Thundering Herd
+
+When rate limits reset, many clients may retry simultaneously. To prevent this:
+
+### 1. Use Random Start (Default)
+
+Don't specify `start` to get automatic randomization:
+
+```typescript
+{
+  kind: "fixed window",
+  rate: 100,
+  period: HOUR,
+  // No start - random between 0 and period
+}
+```
+
+### 2. Add Jitter to Retries
+
+```typescript
+const { ok, retryAfter } = await rateLimiter.limit(ctx, "myLimit");
+
+if (!ok) {
+  // Add random jitter to retry time
+  const jitter = Math.random() * period;
+  const retryAt = retryAfter + jitter;
+  await ctx.scheduler.runAfter(retryAt, internal.myFunction);
+}
+```
+
+### 3. Use Reservations
+
+Reserve capacity ahead of time to avoid retry storms:
+
+```typescript
+const { ok, retryAfter } = await rateLimiter.limit(
+  ctx,
+  "myLimit",
+  { reserve: true }  // Reserve capacity even if not available now
+);
+
+if (retryAfter) {
+  // Capacity reserved for this specific time
+  await ctx.scheduler.runAfter(retryAfter, internal.myFunction, {
+    skipCheck: true,  // Already reserved
+  });
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Token Bucket" icon="bucket" href="/concepts/token-bucket">
+    Learn about the alternative token bucket strategy
+  </Card>
+  <Card title="Basic Usage" icon="code" href="/usage/basic-usage">
+    Start using fixed window rate limiting
+  </Card>
+  <Card title="Scaling with Shards" icon="server" href="/advanced/sharding">
+    Handle high throughput scenarios
+  </Card>
+  <Card title="Reservations" icon="calendar-check" href="/advanced/reservations">
+    Reserve capacity to avoid retry storms
+  </Card>
+</CardGroup>

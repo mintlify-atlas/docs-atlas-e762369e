@@ -1,0 +1,223 @@
+---
+title: check()
+description: Check rate limit status without consuming tokens
+---
+
+## Overview
+
+The `check()` method checks a rate limit's current status without consuming any tokens. This is useful for previewing whether a request would be allowed, or for checking rate limits in queries where you cannot consume tokens.
+
+## Method Signature
+
+```typescript
+async check<Name extends string = keyof Limits & string>(
+  ctx: RunQueryCtx,
+  name: Name,
+  ...options: Name extends keyof Limits & string
+    ? [WithKnownNameOrInlinedConfig<Limits, Name, RateLimitArgs>?]
+    : [WithKnownNameOrInlinedConfig<Limits, Name, RateLimitArgs>]
+): Promise<RateLimitReturns>
+```
+
+## Key Difference from limit()
+
+Unlike [`limit()`](/api/limit), the `check()` method:
+
+- **Does not consume tokens** - It only reads the current state
+- **Can be used in queries** - Since it doesn't mutate state, it works with `runQuery`
+- **Returns the same shape** - The return type is identical to `limit()`
+
+This makes `check()` perfect for UI indicators, permission checks, or deciding whether to attempt an operation.
+
+## Parameters
+
+<ParamField path="ctx" type="RunQueryCtx" required>
+  The context object from a query or mutation, including `runQuery`. Unlike `limit()`, this works with query contexts.
+</ParamField>
+
+<ParamField path="name" type="string" required>
+  The name of the rate limit to check. If this name was defined in the `RateLimiter` constructor, it will be type-checked and auto-completed.
+</ParamField>
+
+<ParamField path="options" type="object">
+  Optional configuration for this rate limit check.
+  
+  <ParamField path="key" type="string">
+    A unique identifier for this rate limit instance. Use this to check per-user, per-IP, or other scoped rate limits.
+  </ParamField>
+  
+  <ParamField path="count" type="number" default="1">
+    The number of tokens to check for availability. The check will return whether this many tokens are available without consuming them.
+  </ParamField>
+  
+  <ParamField path="reserve" type="boolean" default="false">
+    If `true`, checks whether tokens can be reserved for future use. Returns `retryAfter` indicating when the reserved work should execute.
+  </ParamField>
+  
+  <ParamField path="config" type="RateLimitConfig">
+    The rate limit configuration. Required only if the rate limit name was not defined in the `RateLimiter` constructor.
+  </ParamField>
+</ParamField>
+
+<Note>
+  The `throws` option is not available for `check()` since it's typically used for non-blocking status checks.
+</Note>
+
+## Return Type
+
+<ResponseField name="RateLimitReturns" type="object">
+  Returns a promise that resolves to one of two shapes:
+  
+  **When rate limit is not exceeded:**
+  <ResponseField name="ok" type="true" required>
+    Indicates the request would be allowed.
+  </ResponseField>
+  
+  <ResponseField name="retryAfter" type="number">
+    Only present when `reserve: true`. The duration in milliseconds to wait before executing the reserved work.
+  </ResponseField>
+  
+  **When rate limit is exceeded:**
+  <ResponseField name="ok" type="false" required>
+    Indicates the rate limit would be exceeded.
+  </ResponseField>
+  
+  <ResponseField name="retryAfter" type="number" required>
+    The duration in milliseconds when retrying could succeed.
+  </ResponseField>
+</ResponseField>
+
+## Use Cases
+
+### Preview Before Action
+
+Check if an action would be rate-limited before attempting it:
+
+```typescript
+import { mutation } from "./_generated/server";
+import { rateLimiter } from "./rateLimiter";
+
+export const sendMessage = mutation({
+  args: { text: v.string() },
+  handler: async (ctx, args) => {
+    // Check first
+    const canSend = await rateLimiter.check(ctx, "sendMessage", {
+      key: ctx.userId,
+    });
+    
+    if (!canSend.ok) {
+      return {
+        error: `Please wait ${Math.ceil(canSend.retryAfter / 1000)} seconds`,
+      };
+    }
+    
+    // Now consume and send
+    await rateLimiter.limit(ctx, "sendMessage", { key: ctx.userId });
+    await ctx.db.insert("messages", { text: args.text });
+  },
+});
+```
+
+### Query for UI Status
+
+Use in a query to show rate limit status in your UI:
+
+```typescript
+import { query } from "./_generated/server";
+import { rateLimiter } from "./rateLimiter";
+
+export const canUserSendMessage = query({
+  handler: async (ctx) => {
+    const userId = await getCurrentUser(ctx);
+    
+    const status = await rateLimiter.check(ctx, "sendMessage", {
+      key: userId,
+    });
+    
+    return {
+      canSend: status.ok,
+      retryAfter: status.ok ? undefined : status.retryAfter,
+    };
+  },
+});
+```
+
+### Batch Operations
+
+Check if multiple operations would succeed before starting:
+
+```typescript
+export const bulkSendEmails = mutation({
+  args: { recipientIds: v.array(v.id("users")) },
+  handler: async (ctx, args) => {
+    // Check all recipients first
+    const checks = await Promise.all(
+      args.recipientIds.map((id) =>
+        rateLimiter.check(ctx, "sendEmail", { key: id })
+      )
+    );
+    
+    const blockedRecipients = args.recipientIds.filter(
+      (_, i) => !checks[i].ok
+    );
+    
+    if (blockedRecipients.length > 0) {
+      return {
+        error: `${blockedRecipients.length} recipients are rate limited`,
+        blockedRecipients,
+      };
+    }
+    
+    // All clear, proceed with actual sending
+    for (const recipientId of args.recipientIds) {
+      await rateLimiter.limit(ctx, "sendEmail", { key: recipientId });
+      await sendEmail(ctx, recipientId);
+    }
+  },
+});
+```
+
+### Cost Estimation
+
+Check if a large operation would be allowed:
+
+```typescript
+export const estimateUploadCost = query({
+  args: { fileSizeMB: v.number() },
+  handler: async (ctx, args) => {
+    const userId = await getCurrentUser(ctx);
+    const tokensNeeded = Math.ceil(args.fileSizeMB);
+    
+    const status = await rateLimiter.check(ctx, "upload", {
+      key: userId,
+      count: tokensNeeded,
+    });
+    
+    return {
+      allowed: status.ok,
+      tokensNeeded,
+      waitTimeSeconds: status.ok ? 0 : Math.ceil(status.retryAfter / 1000),
+    };
+  },
+});
+```
+
+## Notes
+
+<Note>
+  Since `check()` doesn't consume tokens, calling it multiple times won't affect the rate limit state. This makes it safe to use in queries and for UI status indicators.
+</Note>
+
+<Note>
+  When using `check()` followed by `limit()` in the same mutation, there's a small time gap between the check and the actual consumption. The rate limit state could change between these calls. Use `check()` for guidance, not as a guarantee.
+</Note>
+
+<Warning>
+  Always call `limit()` to actually enforce the rate limit. Using only `check()` without `limit()` will not consume tokens and won't prevent rate limit violations.
+</Warning>
+
+## Related Methods
+
+- [`limit()`](/api/limit) - Check and consume rate limit tokens
+- [`getValue()`](/api/get-value) - Get detailed rate limit state
+- [`reset()`](/api/reset) - Reset a rate limit

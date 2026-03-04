@@ -1,0 +1,372 @@
+---
+title: "Failed Login Protection"
+description: "Prevent brute force attacks by limiting failed authentication attempts per user"
+---
+
+## The Problem
+
+Brute force attacks attempt to guess passwords by trying many combinations. You need to limit failed login attempts per account while allowing successful logins to proceed normally.
+
+## Solution: Per-User Rate Limit with Reset
+
+Use a **per-user rate limit** on failed logins with **manual reset** on successful authentication. This protects individual accounts from credential stuffing attacks.
+
+## Configuration
+
+```ts convex/rateLimits.ts
+import { RateLimiter, HOUR } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Allow only 10 failed login attempts per hour per user
+  failedLogins: {
+    kind: "token bucket",
+    rate: 10,
+    period: HOUR,
+  },
+});
+
+export { rateLimiter };
+```
+
+**Why token bucket?** Tokens accumulate slowly (10 per hour), preventing rapid-fire password attempts. Each failed login consumes a token.
+
+## Complete Authentication Flow
+
+### Backend Mutations
+
+```ts convex/auth.ts
+import { v } from "convex/values";
+import { mutation } from "./_generated/server";
+import { rateLimiter } from "./rateLimits";
+
+export const login = mutation({
+  args: {
+    email: v.string(),
+    password: v.string(),
+  },
+  handler: async (ctx, args) => {
+    // Use email as the rate limit key
+    const rateLimitKey = args.email.toLowerCase();
+
+    // Check rate limit BEFORE attempting authentication
+    const { ok, retryAfter } = await rateLimiter.check(
+      ctx,
+      "failedLogins",
+      { key: rateLimitKey }
+    );
+
+    if (!ok) {
+      const minutesUntilRetry = Math.ceil(retryAfter! / 60000);
+      throw new Error(
+        `Too many failed login attempts. Try again in ${minutesUntilRetry} minutes.`
+      );
+    }
+
+    // Look up user by email
+    const user = await ctx.db
+      .query("users")
+      .withIndex("by_email", (q) => q.eq("email", args.email))
+      .unique();
+
+    if (!user) {
+      // Record failed attempt for non-existent user (prevent enumeration)
+      await rateLimiter.limit(ctx, "failedLogins", {
+        key: rateLimitKey,
+        throws: true,
+      });
+      throw new Error("Invalid email or password");
+    }
+
+    // Verify password
+    const isValid = await verifyPassword(args.password, user.passwordHash);
+
+    if (!isValid) {
+      // Record failed attempt
+      await rateLimiter.limit(ctx, "failedLogins", {
+        key: rateLimitKey,
+        throws: true,
+      });
+      throw new Error("Invalid email or password");
+    }
+
+    // Success! Reset the rate limit for this user
+    await rateLimiter.reset(ctx, "failedLogins", { key: rateLimitKey });
+
+    // Create session token
+    const sessionToken = await createSession(ctx, user._id);
+
+    return {
+      success: true,
+      userId: user._id,
+      sessionToken,
+    };
+  },
+});
+
+async function verifyPassword(
+  password: string,
+  hash: string
+): Promise<boolean> {
+  // Your password verification logic
+  return password === hash;
+}
+
+async function createSession(ctx: any, userId: any): Promise<string> {
+  // Your session creation logic
+  return "session-token";
+}
+```
+
+### Using `throws` for Cleaner Code
+
+Alternatively, use `throws: true` to automatically handle rate limit errors:
+
+```ts convex/auth.ts
+import { isRateLimitError } from "@convex-dev/rate-limiter";
+
+export const loginWithThrows = mutation({
+  args: {
+    email: v.string(),
+    password: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const rateLimitKey = args.email.toLowerCase();
+
+    try {
+      // Check rate limit - throws if exceeded
+      await rateLimiter.check(ctx, "failedLogins", {
+        key: rateLimitKey,
+        throws: true,
+      });
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        const minutesUntilRetry = Math.ceil(error.data.retryAfter / 60000);
+        throw new Error(
+          `Account locked due to too many failed attempts. ` +
+          `Try again in ${minutesUntilRetry} minutes.`
+        );
+      }
+      throw error;
+    }
+
+    // Rest of authentication logic...
+    const user = await ctx.db
+      .query("users")
+      .withIndex("by_email", (q) => q.eq("email", args.email))
+      .unique();
+
+    if (!user || !(await verifyPassword(args.password, user.passwordHash))) {
+      // Record failed attempt - throws if limit exceeded
+      await rateLimiter.limit(ctx, "failedLogins", {
+        key: rateLimitKey,
+        throws: true,
+      });
+      throw new Error("Invalid email or password");
+    }
+
+    // Reset on success
+    await rateLimiter.reset(ctx, "failedLogins", { key: rateLimitKey });
+
+    return { success: true, userId: user._id };
+  },
+});
+```
+
+## Client-Side Usage
+
+```tsx src/LoginForm.tsx
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+import { useState } from "react";
+
+export function LoginForm() {
+  const login = useMutation(api.auth.login);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+
+    try {
+      const result = await login({ email, password });
+      if (result.success) {
+        // Store session and redirect
+        localStorage.setItem("sessionToken", result.sessionToken);
+        window.location.href = "/dashboard";
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Login failed";
+      setError(message);
+
+      // Show additional help for rate limit errors
+      if (message.includes("Too many failed")) {
+        setError(
+          message + " If you've forgotten your password, use the reset link below."
+        );
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input
+        type="email"
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+        placeholder="Email"
+        required
+      />
+      <input
+        type="password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        placeholder="Password"
+        required
+      />
+      <button type="submit" disabled={loading}>
+        {loading ? "Logging in..." : "Log In"}
+      </button>
+      {error && (
+        <div className="error" role="alert">
+          {error}
+        </div>
+      )}
+      <a href="/reset-password">Forgot password?</a>
+    </form>
+  );
+}
+```
+
+## Testing the Protection
+
+```ts convex/test.ts
+import { internalMutation } from "./_generated/server";
+import { rateLimiter } from "./rateLimits";
+
+export const testFailedLoginLimit = internalMutation({
+  handler: async (ctx) => {
+    const email = "test@example.com";
+
+    // Simulate 10 failed login attempts
+    for (let i = 0; i < 10; i++) {
+      const result = await rateLimiter.limit(ctx, "failedLogins", {
+        key: email,
+      });
+      if (!result.ok) {
+        throw new Error(`Attempt ${i + 1} should have succeeded`);
+      }
+      console.log(`Failed attempt ${i + 1} recorded`);
+    }
+
+    // 11th attempt should be blocked
+    const blocked = await rateLimiter.limit(ctx, "failedLogins", {
+      key: email,
+    });
+    if (blocked.ok) {
+      throw new Error("11th attempt should have been blocked");
+    }
+    console.log(`✓ Account locked after 10 attempts`);
+
+    // Test reset functionality
+    await rateLimiter.reset(ctx, "failedLogins", { key: email });
+
+    const afterReset = await rateLimiter.check(ctx, "failedLogins", {
+      key: email,
+    });
+    if (!afterReset.ok) {
+      throw new Error("Rate limit should be reset");
+    }
+    console.log(`✓ Reset working correctly`);
+
+    // Verify other users are not affected
+    const otherUser = await rateLimiter.check(ctx, "failedLogins", {
+      key: "other@example.com",
+    });
+    if (!otherUser.ok) {
+      throw new Error("Other users should not be affected");
+    }
+    console.log(`✓ Per-user isolation confirmed`);
+  },
+});
+```
+
+## Common Variations
+
+<Tabs>
+  <Tab title="Stricter Security">
+    ```ts
+    // Only 5 attempts per hour
+    failedLogins: {
+      kind: "token bucket",
+      rate: 5,
+      period: HOUR,
+    }
+
+    // Or extend the lockout period
+    failedLogins: {
+      kind: "token bucket",
+      rate: 10,
+      period: 24 * HOUR, // 24-hour lockout
+    }
+    ```
+  </Tab>
+  <Tab title="Progressive Delays">
+    ```ts
+    // Check how many attempts remain
+    const status = await rateLimiter.getValue(ctx, "failedLogins", {
+      key: email,
+    });
+
+    const attemptsMade = 10 - status.value;
+    if (attemptsMade >= 5) {
+      // Add artificial delay for repeated failures
+      await new Promise(resolve => 
+        setTimeout(resolve, attemptsMade * 1000)
+      );
+    }
+    ```
+  </Tab>
+  <Tab title="IP-Based Protection">
+    ```ts
+    // Also limit by IP address
+    const ipAddress = ctx.request?.headers?.get("x-forwarded-for") ?? "unknown";
+    
+    await rateLimiter.limit(ctx, "failedLoginsByIP", {
+      key: ipAddress,
+      throws: true,
+    });
+
+    await rateLimiter.limit(ctx, "failedLogins", {
+      key: email,
+      throws: true,
+    });
+    ```
+
+    Configure both limits:
+    ```ts
+    const rateLimiter = new RateLimiter(components.rateLimiter, {
+      failedLogins: { kind: "token bucket", rate: 10, period: HOUR },
+      failedLoginsByIP: { kind: "token bucket", rate: 50, period: HOUR },
+    });
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+  **Security Best Practice:** Always use the same error message for both "user not found" and "invalid password" to prevent account enumeration attacks.
+</Warning>
+
+<Note>
+  **Remember to reset!** Always call `rateLimiter.reset()` on successful login. Otherwise, users will eventually get locked out even with correct credentials.
+</Note>
+
+<Tip>
+  Consider logging failed login attempts to a separate table for security monitoring and alerting on suspicious patterns.
+</Tip>

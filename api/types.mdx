@@ -1,0 +1,418 @@
+---
+title: Types
+description: TypeScript types for rate limiting
+---
+
+This page documents all exported TypeScript types for the Convex Rate Limiter.
+
+## RateLimitConfig
+
+A union type representing the configuration for a rate limit. Can be either a token bucket or fixed window configuration.
+
+```typescript
+type RateLimitConfig =
+  | Infer<typeof tokenBucketValidator>
+  | Infer<typeof fixedWindowValidator>;
+```
+
+### Token Bucket Configuration
+
+A token bucket limits the rate of requests by continuously adding tokens to be consumed when servicing requests.
+
+```typescript
+{
+  kind: "token bucket",
+  rate: number,
+  period: number,
+  capacity?: number,
+  maxReserved?: number,
+  shards?: number,
+  start?: null
+}
+```
+
+<Expandable title="Properties">
+  <ResponseField name="kind" type="literal" required>
+    Must be `"token bucket"`
+  </ResponseField>
+  
+  <ResponseField name="rate" type="number" required>
+    The number of tokens added per `period`
+  </ResponseField>
+  
+  <ResponseField name="period" type="number" required>
+    The time period in milliseconds over which tokens are added
+  </ResponseField>
+  
+  <ResponseField name="capacity" type="number">
+    The maximum number of tokens that can accumulate. Defaults to `rate` if not specified.
+  </ResponseField>
+  
+  <ResponseField name="maxReserved" type="number">
+    The maximum number of tokens that can be reserved ahead of time
+  </ResponseField>
+  
+  <ResponseField name="shards" type="number">
+    The number of shards to distribute the rate limit across for better performance
+  </ResponseField>
+  
+  <ResponseField name="start" type="null">
+    Optional start time (always null for token bucket)
+  </ResponseField>
+</Expandable>
+
+**Example:**
+
+```typescript
+const config: RateLimitConfig = {
+  kind: "token bucket",
+  rate: 10,
+  period: MINUTE,
+  capacity: 20
+};
+```
+
+### Fixed Window Configuration
+
+A fixed window rate limit adds a set number of tokens at the start of each fixed window of time.
+
+```typescript
+{
+  kind: "fixed window",
+  rate: number,
+  period: number,
+  capacity?: number,
+  maxReserved?: number,
+  shards?: number,
+  start?: number
+}
+```
+
+<Expandable title="Properties">
+  <ResponseField name="kind" type="literal" required>
+    Must be `"fixed window"`
+  </ResponseField>
+  
+  <ResponseField name="rate" type="number" required>
+    The number of tokens added at the start of each window
+  </ResponseField>
+  
+  <ResponseField name="period" type="number" required>
+    The window duration in milliseconds
+  </ResponseField>
+  
+  <ResponseField name="capacity" type="number">
+    The maximum number of tokens that can accumulate. Defaults to `rate` if not specified.
+  </ResponseField>
+  
+  <ResponseField name="maxReserved" type="number">
+    The maximum number of tokens that can be reserved ahead of time
+  </ResponseField>
+  
+  <ResponseField name="shards" type="number">
+    The number of shards to distribute the rate limit across for better performance
+  </ResponseField>
+  
+  <ResponseField name="start" type="number">
+    Determines what the windows are relative to in UTC time. If not provided, it will be a random number between 0 and `period`.
+  </ResponseField>
+</Expandable>
+
+**Example:**
+
+```typescript
+const config: RateLimitConfig = {
+  kind: "fixed window",
+  rate: 100,
+  period: HOUR,
+  start: 0
+};
+```
+
+---
+
+## RateLimitArgs
+
+Arguments for rate limiting operations.
+
+```typescript
+type RateLimitArgs = {
+  /** The name of the rate limit. */
+  name: string;
+  /** The key to use for the rate limit. If not provided, the rate limit
+   * is a single shared value.  */
+  key?: string;
+  /**  The number of tokens to consume. Defaults to 1. */
+  count?: number;
+  /**  Whether to reserve the tokens ahead of time. Defaults to false. */
+  reserve?: boolean;
+  /**  Whether to throw an error if the rate limit is exceeded.
+   * By default, check/consume will just return { ok: false, retryAfter: number }.
+   */
+  throws?: boolean;
+  /** The rate limit configuration. See {@link RateLimitConfig}. */
+  config: RateLimitConfig;
+};
+```
+
+<Expandable title="Properties">
+  <ResponseField name="name" type="string" required>
+    The name of the rate limit
+  </ResponseField>
+  
+  <ResponseField name="key" type="string">
+    The key to use for the rate limit. If not provided, the rate limit is a single shared value.
+  </ResponseField>
+  
+  <ResponseField name="count" type="number">
+    The number of tokens to consume. Defaults to 1.
+  </ResponseField>
+  
+  <ResponseField name="reserve" type="boolean">
+    Whether to reserve the tokens ahead of time. Defaults to false.
+  </ResponseField>
+  
+  <ResponseField name="throws" type="boolean">
+    Whether to throw an error if the rate limit is exceeded. By default, check/consume will just return `{ ok: false, retryAfter: number }`.
+  </ResponseField>
+  
+  <ResponseField name="config" type="RateLimitConfig" required>
+    The rate limit configuration. See [RateLimitConfig](#ratelimitconfig).
+  </ResponseField>
+</Expandable>
+
+**Example:**
+
+```typescript
+const args: RateLimitArgs = {
+  name: "sendMessage",
+  key: userId,
+  count: 1,
+  throws: true,
+  config: {
+    kind: "token bucket",
+    rate: 10,
+    period: MINUTE
+  }
+};
+```
+
+---
+
+## RateLimitReturns
+
+Return value from rate limiting operations.
+
+```typescript
+type RateLimitReturns = 
+  | {
+      ok: true,
+      retryAfter?: number
+    }
+  | {
+      ok: false,
+      retryAfter: number
+    };
+```
+
+<Expandable title="Success Response">
+  <ResponseField name="ok" type="true" required>
+    Indicates the request is allowed
+  </ResponseField>
+  
+  <ResponseField name="retryAfter" type="number">
+    Optional duration in milliseconds to wait before executing reserved work. Only present when using `reserve: true`.
+  </ResponseField>
+</Expandable>
+
+<Expandable title="Failure Response">
+  <ResponseField name="ok" type="false" required>
+    Indicates the rate limit was exceeded
+  </ResponseField>
+  
+  <ResponseField name="retryAfter" type="number" required>
+    Duration in milliseconds when retrying could succeed
+  </ResponseField>
+</Expandable>
+
+**Example:**
+
+```typescript
+const result = await rateLimiter.limit(ctx, "sendMessage", { key: userId });
+
+if (result.ok) {
+  // Request allowed
+  if (result.retryAfter) {
+    // For reserved tokens, schedule work
+    await ctx.scheduler.runAfter(result.retryAfter, internal.sendMessage, {...});
+  }
+} else {
+  // Rate limited - retry after result.retryAfter ms
+  console.log(`Rate limited. Retry after ${result.retryAfter}ms`);
+}
+```
+
+---
+
+## RateLimitError
+
+Error type thrown when `throws: true` is used and the rate limit is exceeded.
+
+```typescript
+type RateLimitError = {
+  kind: "RateLimited";
+  name: string;
+  retryAfter: number;
+};
+```
+
+<ResponseField name="kind" type="literal" required>
+  Always `"RateLimited"` to identify this error type
+</ResponseField>
+
+<ResponseField name="name" type="string" required>
+  The name of the rate limit that was exceeded
+</ResponseField>
+
+<ResponseField name="retryAfter" type="number" required>
+  Duration in milliseconds when retrying could succeed
+</ResponseField>
+
+**Example:**
+
+```typescript
+import { isRateLimitError } from "@convex-dev/rate-limiter";
+
+try {
+  await rateLimiter.limit(ctx, "sendMessage", { 
+    key: userId, 
+    throws: true 
+  });
+} catch (error) {
+  if (isRateLimitError(error)) {
+    console.log(`Rate limited on ${error.data.name}`);
+    console.log(`Retry after ${error.data.retryAfter}ms`);
+  }
+}
+```
+
+---
+
+## GetValueArgs
+
+Arguments for getting the current value of a rate limit.
+
+```typescript
+type GetValueArgs = {
+  name?: string;
+  key?: string;
+  sampleShards?: number;
+  config?: RateLimitConfig;
+};
+```
+
+<ResponseField name="name" type="string">
+  The name of the rate limit
+</ResponseField>
+
+<ResponseField name="key" type="string">
+  The key to check. If not provided, checks the shared value.
+</ResponseField>
+
+<ResponseField name="sampleShards" type="number">
+  The number of shards to sample when checking the value
+</ResponseField>
+
+<ResponseField name="config" type="RateLimitConfig">
+  The rate limit configuration if not using a pre-defined limit
+</ResponseField>
+
+**Example:**
+
+```typescript
+const value = await rateLimiter.getValue(ctx, "sendMessage", {
+  key: userId,
+  sampleShards: 1
+});
+```
+
+---
+
+## GetValueReturns
+
+Return value from getting the current rate limit value.
+
+```typescript
+type GetValueReturns = {
+  value: number;
+  ts: number;
+  shard: number;
+  config: RateLimitConfig;
+};
+```
+
+<ResponseField name="value" type="number" required>
+  The current number of available tokens
+</ResponseField>
+
+<ResponseField name="ts" type="number" required>
+  The timestamp of the last update (in milliseconds)
+</ResponseField>
+
+<ResponseField name="shard" type="number" required>
+  The shard number that was sampled
+</ResponseField>
+
+<ResponseField name="config" type="RateLimitConfig" required>
+  The rate limit configuration
+</ResponseField>
+
+**Example:**
+
+```typescript
+const { value, ts, shard, config } = await rateLimiter.getValue(
+  ctx, 
+  "sendMessage", 
+  { key: userId }
+);
+
+console.log(`${value} tokens available at ${new Date(ts)}`);
+```
+
+---
+
+## Validators
+
+Convex validators for rate limit configurations.
+
+### tokenBucketValidator
+
+```typescript
+const tokenBucketValidator = v.object({
+  kind: v.literal("token bucket"),
+  rate: v.number(),
+  period: v.number(),
+  capacity: v.optional(v.number()),
+  maxReserved: v.optional(v.number()),
+  shards: v.optional(v.number()),
+  start: v.optional(v.null()),
+});
+```
+
+Convex validator for token bucket configurations. Use with `Infer<typeof tokenBucketValidator>` to get the TypeScript type.
+
+### fixedWindowValidator
+
+```typescript
+const fixedWindowValidator = v.object({
+  kind: v.literal("fixed window"),
+  rate: v.number(),
+  period: v.number(),
+  capacity: v.optional(v.number()),
+  maxReserved: v.optional(v.number()),
+  shards: v.optional(v.number()),
+  start: v.optional(v.number()),
+});
+```
+
+Convex validator for fixed window configurations. Use with `Infer<typeof fixedWindowValidator>` to get the TypeScript type.

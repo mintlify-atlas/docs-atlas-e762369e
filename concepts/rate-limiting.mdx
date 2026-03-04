@@ -1,0 +1,77 @@
+---
+title: "Rate Limiting"
+description: "Understanding rate limiting and how it works in Convex"
+---
+
+## What is Rate Limiting?
+
+Rate limiting is the technique of controlling how often actions can be performed, typically on a server. It helps protect your application from abuse, ensures fair resource allocation, and prevents system overload.
+
+## Network-Layer vs Application-Layer
+
+There are many options for achieving rate limiting, most of which operate at the **network layer**. This is your first line of defense against sophisticated DDoS attacks.
+
+**Application-layer rate limiting** happens in your app's code where you handle authentication, authorization, and other business logic. It allows you to define nuanced rules and enforce policies more fairly.
+
+While application-layer rate limiting is not the first line of defense for sophisticated DDoS attacks (which thankfully are extremely rare), it serves most real-world use cases effectively.
+
+## Common Use Cases
+
+Rate limiting is essential for many scenarios:
+
+- **Preventing bot abuse**: Limit free trial signups to deter automated bot registrations
+- **Spam prevention**: Control how fast users can send messages or post content
+- **API protection**: Enforce fair usage of external APIs (like LLM services)
+- **Security**: Limit failed login attempts to prevent brute force attacks
+- **Resource management**: Prevent individual users from consuming excessive server resources
+
+## How It Works in Convex
+
+The Convex Rate Limiter provides application-layer rate limiting with several key advantages:
+
+### Transactional Guarantees
+
+Rate limit changes are **transactional** - all rate limit changes will roll back if your mutation fails. This ensures consistency between your rate limiting state and your application state.
+
+### ACID Compliance
+
+Convex provides strong ACID guarantees through its transactional system:
+
+- **Atomicity**: Rate limit checks and updates happen atomically with your mutations
+- **Consistency**: The rate limiter never allows more requests than configured
+- **Isolation**: Concurrent requests are properly isolated using optimistic concurrency control
+- **Durability**: Rate limit state persists reliably in the Convex database
+
+<Note>
+Because Convex provides strong transactions, rate limit checks will never overwrite each other. You don't have to worry about the rate limiter succeeding more often than it should.
+</Note>
+
+### Fails Closed, Not Open
+
+The rate limiter is designed to **fail closed** rather than open. This means that if there's an error or the system is overwhelmed, it will deny requests rather than allow them through, avoiding cascading failures.
+
+### Key Differentiators
+
+- **Type-safe usage**: You won't accidentally misspell a rate limit name
+- **Efficient storage**: Storage is not proportional to the number of requests
+- **Configurable algorithms**: Choose between fixed window or token bucket strategies
+- **Scalable sharding**: Increase throughput without compromising correctness
+- **Fairness guarantees**: Credit "reservation" saves you from exponential backoff
+- **Burst allowance**: Opt-in rollover capacity via configurable `capacity`
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Rate Limiting Strategies" icon="layer-group" href="/concepts/strategies">
+    Learn about token bucket and fixed window algorithms
+  </Card>
+  <Card title="Token Bucket" icon="bucket" href="/concepts/token-bucket">
+    Deep dive into the token bucket strategy
+  </Card>
+  <Card title="Fixed Window" icon="window" href="/concepts/fixed-window">
+    Deep dive into the fixed window strategy
+  </Card>
+  <Card title="Getting Started" icon="rocket" href="/quickstart">
+    Start implementing rate limiting
+  </Card>
+</CardGroup>

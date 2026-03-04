@@ -1,0 +1,261 @@
+---
+title: Capacity Reservation
+description: Reserve capacity ahead of time to prevent starvation and enable fair queueing
+---
+
+## What is Capacity Reservation?
+
+Capacity reservation allows you to "book" rate limit capacity for future use. When you reserve capacity, you receive a `retryAfter` time at which you can execute your operation without re-checking the rate limit.
+
+This prevents **starvation** on larger requests and enables fair queueing of operations.
+
+## The Problem: Starvation
+
+Without reservations, large requests can be repeatedly blocked:
+
+```ts
+// Without reservation: this might fail repeatedly
+const status = await rateLimiter.limit(ctx, "llmTokens", { count: 1000 });
+if (!status.ok) {
+  // By the time we retry, capacity might be consumed by other requests
+  return { error: "Rate limited" };
+}
+```
+
+Smaller requests can continuously consume available capacity, preventing large requests from ever succeeding.
+
+## The Solution: Reserve Capacity
+
+With the `reserve` parameter, you can guarantee future execution:
+
+```ts
+const status = await rateLimiter.limit(ctx, "llmTokens", {
+  count: 1000,
+  reserve: true,
+});
+
+if (status.retryAfter) {
+  // Capacity is reserved! We can run at this exact time
+  await ctx.scheduler.runAfter(status.retryAfter, internal.ai.processRequest, {
+    skipCheck: true, // We've already reserved capacity
+  });
+}
+```
+
+## How Reservations Work
+
+1. **Check available capacity**: The rate limiter checks if there's enough capacity now or in the future
+2. **Reserve tokens**: If not immediately available, it reserves capacity at a future time
+3. **Return retryAfter**: You receive the exact time when your operation can run
+4. **Execute without re-checking**: At that time, skip the rate limit check
+
+## Complete Pattern with Scheduler
+
+Here's the recommended pattern for using reservations with `ctx.scheduler`:
+
+```ts
+import { internalAction } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { v } from "convex/values";
+
+export const processLLMRequest = internalAction({
+  args: {
+    prompt: v.string(),
+    tokens: v.number(),
+    skipCheck: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args) => {
+    if (!args.skipCheck) {
+      // Reserve future capacity instead of just failing now
+      const status = await rateLimiter.limit(ctx, "llmRequests", {
+        count: args.tokens,
+        reserve: true,
+      });
+      
+      if (status.retryAfter) {
+        // Schedule for future execution with reserved capacity
+        await ctx.scheduler.runAfter(
+          status.retryAfter,
+          internal.ai.processLLMRequest,
+          {
+            ...args,
+            // When we run in the future, skip the rate limit check
+            // since we've just reserved that capacity
+            skipCheck: true,
+          },
+        );
+        return { scheduled: true, executeAt: Date.now() + status.retryAfter };
+      }
+    }
+    
+    // Either we had immediate capacity, or this is our reserved execution
+    const result = await callLLMAPI(args.prompt);
+    return { result };
+  },
+});
+```
+
+## The skipCheck Pattern
+
+The `skipCheck` parameter is crucial:
+
+```ts
+args: {
+  skipCheck: v.optional(v.boolean()),
+}
+
+if (!args.skipCheck) {
+  // Only check rate limit if this isn't a reserved execution
+  const status = await rateLimiter.limit(ctx, "name", { reserve: true });
+  // ...
+}
+```
+
+<Warning>
+  **Important**: Always use `skipCheck` for scheduled executions after reserving capacity. Otherwise, you'll check the rate limit twice and consume double the tokens.
+</Warning>
+
+## Preventing Starvation
+
+Reservations ensure fairness by queueing operations:
+
+```ts
+// Three requests arrive at the same time
+// Request 1: 100 tokens
+const r1 = await rateLimiter.limit(ctx, "api", { count: 100, reserve: true });
+// executes immediately (ok: true, retryAfter: 0)
+
+// Request 2: 100 tokens  
+const r2 = await rateLimiter.limit(ctx, "api", { count: 100, reserve: true });
+// scheduled for future (ok: true, retryAfter: 1000)
+
+// Request 3: 100 tokens
+const r3 = await rateLimiter.limit(ctx, "api", { count: 100, reserve: true });
+// scheduled further out (ok: true, retryAfter: 2000)
+```
+
+Each request gets a guaranteed execution time, preventing starvation.
+
+## Maximum Reservations
+
+You can limit how far ahead capacity can be reserved:
+
+```ts
+const config = {
+  kind: "token bucket",
+  rate: 1000,
+  period: MINUTE,
+  maxReserved: 2000, // Can reserve up to 2x the rate
+};
+```
+
+When `maxReserved` is exceeded, `ok` will be `false`:
+
+```ts
+const status = await rateLimiter.limit(ctx, "api", {
+  count: 5000,
+  reserve: true,
+});
+
+if (!status.ok) {
+  // maxReserved exceeded - reject the request
+  throw new Error("Request too large or queue too full");
+}
+```
+
+## Use Cases
+
+### 1. Large Batch Operations
+
+```ts
+export const processBatch = internalAction({
+  args: { items: v.array(v.any()), skipCheck: v.optional(v.boolean()) },
+  handler: async (ctx, args) => {
+    if (!args.skipCheck) {
+      const status = await rateLimiter.limit(ctx, "batchAPI", {
+        count: args.items.length,
+        reserve: true,
+      });
+      
+      if (status.retryAfter) {
+        await ctx.scheduler.runAfter(status.retryAfter, internal.batch.processBatch, {
+          ...args,
+          skipCheck: true,
+        });
+        return;
+      }
+    }
+    
+    // Process the batch
+  },
+});
+```
+
+### 2. Fair Queueing
+
+```ts
+export const queuedOperation = mutation({
+  args: { userId: v.id("users"), data: v.any() },
+  handler: async (ctx, args) => {
+    const status = await rateLimiter.limit(ctx, "userOperations", {
+      key: args.userId,
+      reserve: true,
+    });
+    
+    if (status.retryAfter) {
+      await ctx.scheduler.runAfter(
+        status.retryAfter,
+        internal.operations.executeOperation,
+        { userId: args.userId, data: args.data, skipCheck: true },
+      );
+      return { queued: true, executeAt: Date.now() + status.retryAfter };
+    }
+    
+    return { immediate: true };
+  },
+});
+```
+
+### 3. LLM API Rate Limiting
+
+```ts
+export const generateText = internalAction({
+  args: {
+    prompt: v.string(),
+    estimatedTokens: v.number(),
+    skipCheck: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args) => {
+    if (!args.skipCheck) {
+      const status = await rateLimiter.limit(ctx, "llmTokens", {
+        count: args.estimatedTokens,
+        reserve: true,
+      });
+      
+      if (status.retryAfter) {
+        await ctx.scheduler.runAfter(
+          status.retryAfter,
+          internal.llm.generateText,
+          { ...args, skipCheck: true },
+        );
+        return { status: "scheduled", executeAt: Date.now() + status.retryAfter };
+      }
+    }
+    
+    const result = await callOpenAI(args.prompt);
+    return { status: "complete", result };
+  },
+});
+```
+
+## Best Practices
+
+1. **Always use skipCheck**: When executing reserved capacity, always pass `skipCheck: true`
+2. **Estimate conservatively**: Reserve slightly more capacity than you think you'll need
+3. **Set maxReserved**: Prevent unbounded queueing with `maxReserved`
+4. **Handle scheduling failures**: Check if scheduling succeeded and handle errors
+5. **Use with actions**: Reservations work best with `internalAction` for async operations
+
+<Note>
+  Reservations are particularly useful for preventing thundering herd problems. See the [Jitter](/advanced/jitter) guide for more techniques to handle burst traffic.
+</Note>

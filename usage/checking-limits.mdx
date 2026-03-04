@@ -1,0 +1,386 @@
+---
+title: Checking Limits
+description: Check rate limits without consuming tokens using check() and getValue()
+---
+
+## Overview
+
+Sometimes you need to check if a rate limit would allow a request *without* actually consuming any tokens. The Convex Rate Limiter provides two methods for this:
+
+1. **`check()`** - Check if a request would be allowed
+2. **`getValue()`** - Get the current token count and metadata
+
+## The check() Method
+
+The `check()` method evaluates a rate limit without consuming any tokens:
+
+```ts
+const status = await rateLimiter.check(ctx, "sendMessage", { 
+  key: userId 
+});
+
+if (status.ok) {
+  // The user has capacity available
+  // But we haven't consumed any tokens yet
+}
+```
+
+From `src/client/index.ts:78-111`:
+
+```ts
+/**
+ * Check a rate limit.
+ * This function will check the rate limit and return whether the request is
+ * allowed, and if not, when it could be retried.
+ * Unlike {@link limit}, this function does not consume any tokens.
+ *
+ * @param ctx The ctx object from a query or mutation, including runQuery.
+ * @param name The name of the rate limit.
+ * @param options The rate limit arguments.
+ * @returns `{ ok, retryAfter }`: `ok` is true if the rate limit is not exceeded.
+ * `retryAfter` is the duration in milliseconds when retrying could succeed.
+ */
+async check<Name extends string = keyof Limits & string>(
+  ctx: RunQueryCtx,
+  name: Name,
+  ...options
+): Promise<RateLimitReturns> {
+  return ctx.runQuery(this.component.lib.checkRateLimit, {
+    ...options[0],
+    name,
+    config: this.getConfig(options[0], name),
+  });
+}
+```
+
+## Difference Between check() and limit()
+
+<CodeGroup>
+```ts limit() - Consumes tokens
+const status = await rateLimiter.limit(ctx, "sendMessage", { key: userId });
+// ✅ Returns { ok, retryAfter }
+// ⚠️  CONSUMES a token if ok is true
+// ⚠️  Must be called in a MUTATION
+```
+
+```ts check() - Does NOT consume tokens
+const status = await rateLimiter.check(ctx, "sendMessage", { key: userId });
+// ✅ Returns { ok, retryAfter }
+// ✅ Does NOT consume any tokens
+// ✅ Can be called in a QUERY or MUTATION
+```
+</CodeGroup>
+
+Key differences:
+
+| Feature | `limit()` | `check()` |
+|---------|-----------|----------|
+| Consumes tokens | ✅ Yes | ❌ No |
+| Can be used in queries | ❌ No | ✅ Yes |
+| Can be used in mutations | ✅ Yes | ✅ Yes |
+| Returns same format | ✅ `{ok, retryAfter}` | ✅ `{ok, retryAfter}` |
+
+## Use Cases for Checking Without Consuming
+
+### 1. Showing Rate Limit Status to Users
+
+Display remaining capacity before the user takes action:
+
+```ts
+export const getMessageStatus = query({
+  args: {},
+  handler: async (ctx) => {
+    const user = await ctx.auth.getUserIdentity();
+    if (!user) return { canSend: false };
+    
+    const status = await rateLimiter.check(ctx, "sendMessage", {
+      key: user.subject,
+    });
+    
+    return {
+      canSend: status.ok,
+      retryAfter: status.retryAfter,
+    };
+  },
+});
+```
+
+Then in your UI:
+
+```tsx
+function ChatBox() {
+  const status = useQuery(api.messages.getMessageStatus);
+  
+  return (
+    <div>
+      <input disabled={!status?.canSend} />
+      {!status?.canSend && (
+        <p>Rate limited. Try again in {Math.ceil(status.retryAfter! / 1000)}s</p>
+      )}
+    </div>
+  );
+}
+```
+
+### 2. Validating Before Expensive Operations
+
+Check capacity before starting expensive work:
+
+```ts
+export const generateReport = mutation({
+  args: { teamId: v.string() },
+  handler: async (ctx, args) => {
+    // Check first (doesn't consume)
+    const status = await rateLimiter.check(ctx, "reportGeneration", {
+      key: args.teamId,
+    });
+    
+    if (!status.ok) {
+      return { 
+        error: "Report quota exceeded", 
+        retryAfter: status.retryAfter 
+      };
+    }
+    
+    // Now consume and proceed
+    await rateLimiter.limit(ctx, "reportGeneration", {
+      key: args.teamId,
+      throws: true,
+    });
+    
+    // Generate the expensive report
+    const report = await generateExpensiveReport();
+    return { report };
+  },
+});
+```
+
+### 3. Conditional Logic Based on Capacity
+
+```ts
+export const processRequest = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const fastPathStatus = await rateLimiter.check(ctx, "fastPath");
+    
+    if (fastPathStatus.ok) {
+      // Take the fast path
+      await rateLimiter.limit(ctx, "fastPath", { throws: true });
+      return await fastProcess();
+    } else {
+      // Fall back to slow path
+      await rateLimiter.limit(ctx, "slowPath", { throws: true });
+      return await slowProcess();
+    }
+  },
+});
+```
+
+### 4. Real Example from Source Code
+
+From `example/convex/example.ts:80-85`:
+
+```ts
+export const check = internalQuery({
+  args: { key: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    return rateLimiter.check(ctx, "sendMessage", { key: args.key });
+  },
+});
+```
+
+## The getValue() Method
+
+For more detailed information about the current state, use `getValue()`:
+
+```ts
+const { config, value, ts } = await rateLimiter.getValue(ctx, "sendMessage", {
+  key: userId,
+});
+```
+
+From `src/client/index.ts:168-209`:
+
+```ts
+/**
+ * Get the current value and metadata of a rate limit.
+ * This function returns the current token utilization data without consuming any tokens.
+ *
+ * @param ctx The ctx object from a query, including runQuery.
+ * @param name The name of the rate limit.
+ * @param options The rate limit arguments.
+ * @returns An object containing the current value, timestamp, window start time (for fixed window),
+ * and the rate limit configuration.
+ */
+async getValue<Name extends string = keyof Limits & string>(
+  ctx: RunQueryCtx,
+  name: Name,
+  ...options
+): Promise<GetValueReturns> {
+  return ctx.runQuery(this.component.lib.getValue, {
+    ...options[0],
+    name,
+    config: this.getConfig(options[0], name),
+  });
+}
+```
+
+### Return Value Structure
+
+```ts
+type GetValueReturns = {
+  config: RateLimitConfig;  // The rate limit configuration
+  value: number;            // Current token count
+  ts: number;               // Timestamp when last updated
+  // For fixed window:
+  windowStart?: number;     // When the current window started
+};
+```
+
+### Example: Displaying Quota Information
+
+```ts
+export const getQuotaInfo = query({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await getUserId(ctx);
+    const { config, value, ts } = await rateLimiter.getValue(ctx, "apiCalls", {
+      key: userId,
+    });
+    
+    return {
+      used: config.rate - value,
+      limit: config.rate,
+      remaining: value,
+      resetsIn: config.period - (Date.now() - ts),
+    };
+  },
+});
+```
+
+Then display in your UI:
+
+```tsx
+function QuotaDisplay() {
+  const quota = useQuery(api.quota.getQuotaInfo);
+  
+  if (!quota) return null;
+  
+  return (
+    <div>
+      <p>API Calls: {quota.used} / {quota.limit}</p>
+      <p>Remaining: {quota.remaining}</p>
+      <p>Resets in: {Math.ceil(quota.resetsIn / 1000)}s</p>
+      <ProgressBar value={quota.used} max={quota.limit} />
+    </div>
+  );
+}
+```
+
+## Using calculateRateLimit
+
+You can calculate the value at a specific timestamp using the `calculateRateLimit` helper:
+
+```ts
+import { calculateRateLimit } from "@convex-dev/rate-limiter";
+
+const { config, value, ts } = await rateLimiter.getValue(ctx, "sendMessage", {
+  key: userId,
+});
+
+// Calculate the value 30 seconds from now
+const futureValue = calculateRateLimit(
+  { value, ts },
+  config,
+  Date.now() + 30000,  // 30 seconds in the future
+  0,  // count to consume
+);
+```
+
+From the README:
+> "You can use `calculateRateLimit` to calculate the value at a given timestamp"
+
+## Check with Custom Count
+
+You can check if there's enough capacity for a specific count:
+
+```ts
+// Check if we have capacity for 100 tokens
+const status = await rateLimiter.check(ctx, "llmTokens", {
+  key: userId,
+  count: 100,
+});
+
+if (status.ok) {
+  // We have enough capacity for 100 tokens
+  // But we haven't consumed them yet
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Check before expensive operations">
+    For operations that are expensive to start but cheap to validate:
+    
+    ```ts
+    // Check first (fast, doesn't consume)
+    const canProceed = await rateLimiter.check(ctx, "export", { key: teamId });
+    if (!canProceed.ok) {
+      return { error: "Rate limited" };
+    }
+    
+    // Then consume (commits the operation)
+    await rateLimiter.limit(ctx, "export", { key: teamId, throws: true });
+    
+    // Proceed with expensive work
+    ```
+  </Accordion>
+  
+  <Accordion title="Use check() in queries for UI state">
+    Queries can't consume tokens (they can't modify state), so use `check()`:
+    
+    ```ts
+    export const canSendMessage = query({
+      handler: async (ctx) => {
+        const userId = await getUserId(ctx);
+        return rateLimiter.check(ctx, "sendMessage", { key: userId });
+      },
+    });
+    ```
+  </Accordion>
+  
+  <Accordion title="Avoid check-then-limit race conditions">
+    If you check in a query and then limit in a mutation, the state might change between calls. For critical operations, just use `limit()` directly:
+    
+    ```ts
+    // ❌ Risky: state might change between calls
+    const canSend = await query(api.messages.canSend);  // check()
+    if (canSend.ok) {
+      await mutation(api.messages.send);  // limit()
+    }
+    
+    // ✅ Better: atomic check-and-consume
+    const result = await mutation(api.messages.send);  // limit() inside
+    ```
+  </Accordion>
+  
+  <Accordion title="Use getValue() for analytics and monitoring">
+    Track rate limit utilization over time:
+    
+    ```ts
+    const { value, config } = await rateLimiter.getValue(ctx, "apiCalls");
+    const utilizationPercent = ((config.rate - value) / config.rate) * 100;
+    
+    if (utilizationPercent > 80) {
+      console.warn(`High rate limit utilization: ${utilizationPercent}%`);
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+- Learn about [Resetting Limits](/usage/resetting-limits) to clear rate limit state
+- Understand [Error Handling](/usage/error-handling) with `throws`
+- Explore the [React Hook](/advanced/react-hooks) for client-side checking

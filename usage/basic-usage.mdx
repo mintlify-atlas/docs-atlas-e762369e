@@ -1,0 +1,148 @@
+---
+title: Basic Usage
+description: Learn how to use the RateLimiter for simple, global rate limiting
+---
+
+## Overview
+
+The most basic use of the Convex Rate Limiter is to create a global (singleton) rate limit that applies to all requests regardless of user or context.
+
+## Creating a RateLimiter Instance
+
+First, import the `RateLimiter` class and create an instance with your rate limit configurations:
+
+```ts
+import { RateLimiter, MINUTE, HOUR } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // One global / singleton rate limit using a "fixed window" algorithm
+  freeTrialSignUp: { kind: "fixed window", rate: 100, period: HOUR },
+  // A token bucket rate limit
+  sendMessage: { kind: "token bucket", rate: 10, period: MINUTE, capacity: 3 },
+});
+```
+
+### Time Constants
+
+The library provides helpful time constants:
+
+- `SECOND` = 1000 milliseconds
+- `MINUTE` = 60 seconds
+- `HOUR` = 60 minutes
+- `DAY` = 24 hours
+- `WEEK` = 7 days
+
+## Using limit() in Mutations
+
+Call `limit()` in any mutation to enforce a rate limit:
+
+```ts
+import { mutation } from "./_generated/server";
+
+export const signUpForFreeTrial = mutation({
+  args: {},
+  handler: async (ctx) => {
+    // Check the global rate limit
+    const { ok, retryAfter } = await rateLimiter.limit(ctx, "freeTrialSignUp");
+    
+    if (!ok) {
+      throw new Error(`Rate limit exceeded. Try again in ${retryAfter}ms`);
+    }
+    
+    // Proceed with sign-up logic
+    // ...
+  },
+});
+```
+
+## Understanding the Return Value
+
+The `limit()` method returns an object with two properties:
+
+### `ok` (boolean)
+
+Indicates whether the request was allowed:
+- `true`: The rate limit was not exceeded, and a token was consumed
+- `false`: The rate limit was exceeded, and no token was consumed
+
+### `retryAfter` (number | undefined)
+
+The duration in milliseconds until the request could succeed:
+- When `ok` is `false`: How long to wait before retrying
+- When `ok` is `true` and `retryAfter` is defined: You reserved capacity for the future (see [Reserving Capacity](/advanced/reservations))
+- `undefined`: The request succeeded immediately
+
+```ts
+const status = await rateLimiter.limit(ctx, "freeTrialSignUp");
+
+if (status.ok && !status.retryAfter) {
+  // Request succeeded immediately
+}
+
+if (!status.ok && status.retryAfter) {
+  // Request failed, retry after this many milliseconds
+  console.log(`Retry after ${status.retryAfter}ms`);
+}
+```
+
+## Global vs Singleton Rate Limits
+
+When you call `limit()` without a `key` parameter, the rate limit applies globally to all requests:
+
+```ts
+// This rate limit is shared across ALL users and requests
+const status = await rateLimiter.limit(ctx, "freeTrialSignUp");
+```
+
+This is useful for:
+- Protecting expensive operations (LLM API calls, image generation)
+- Preventing bot signups
+- Rate limiting anonymous users
+- Enforcing global API quotas
+
+<Note>
+For per-user rate limits, see [Per-User Limits](/usage/per-user-limits).
+</Note>
+
+## Complete Example
+
+Here's a complete example from the source code:
+
+```ts
+import { RateLimiter, HOUR } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+import { mutation } from "./_generated/server";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  freeTrialSignUp: { kind: "fixed window", rate: 100, period: HOUR },
+});
+
+export const signUpForFreeTrial = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const { ok, retryAfter } = await rateLimiter.limit(ctx, "freeTrialSignUp");
+    
+    if (!ok) {
+      return { 
+        success: false, 
+        error: `Too many signups. Try again in ${Math.ceil(retryAfter! / 1000)} seconds` 
+      };
+    }
+    
+    // Create free trial account
+    const userId = await ctx.db.insert("users", {
+      plan: "free_trial",
+      createdAt: Date.now(),
+    });
+    
+    return { success: true, userId };
+  },
+});
+```
+
+## Next Steps
+
+- Learn about [Per-User Limits](/usage/per-user-limits)
+- Understand [Error Handling](/usage/error-handling) with the `throws` option
+- Explore [Rate Limit Strategies](/concepts/strategies)

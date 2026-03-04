@@ -1,0 +1,77 @@
+---
+title: Introduction
+description: Application-layer rate limiting for Convex with type-safe, transactional guarantees
+---
+
+## What is Convex Rate Limiter?
+
+Convex Rate Limiter is a component that provides **application-layer rate limiting** for your Convex backend. It allows you to control how often actions can be performed in your application with type-safe, transactional guarantees.
+
+<Card title="Learn More" icon="book" href="https://stack.convex.dev/rate-limiting">
+  Read the full Stack post on rate limiting patterns and implementation details
+</Card>
+
+## Why Use Application-Layer Rate Limiting?
+
+Rate limiting is the technique of controlling how often actions can be performed, typically on a server. While most rate limiting solutions operate at the **network layer**, application-layer rate limiting happens in your app's code where you handle authentication, authorization, and other business logic.
+
+**Network-layer vs Application-layer:**
+
+- **Network-layer rate limiting** operates at the infrastructure level (CDN, load balancer, API gateway). It's the first line of defense against sophisticated DDoS attacks but lacks context about your application logic.
+
+- **Application-layer rate limiting** runs in your business logic where you have full context about users, teams, sessions, and actions. It allows you to define nuanced rules and enforce policies more fairly.
+
+While application-layer rate limiting is not the primary defense against sophisticated DDoS attacks (which are thankfully extremely rare), it serves most real-world use cases effectively.
+
+## Key Differentiators
+
+What makes Convex Rate Limiter stand out:
+
+- **Type-safe usage** - You won't accidentally misspell a rate limit name thanks to TypeScript integration
+- **Transactional evaluation** - All rate limit changes roll back if your mutation fails, ensuring consistency
+- **Configurable algorithms** - Choose between fixed window or token bucket strategies
+- **Efficient storage** - Storage is not proportional to the number of requests
+- **Configurable sharding** - Scale to high throughput without compromising correctness
+- **Fairness guarantees** - Credit "reservation" system saves you from exponential backoff
+- **Burst allowance** - Opt-in "rollover" via configurable `capacity`
+- **Fails closed** - Avoids cascading failure when traffic overwhelms your rate limits
+
+## Common Use Cases
+
+```typescript
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  freeTrialSignUp: { kind: "fixed window", rate: 100, period: HOUR },
+  sendMessage: { kind: "token bucket", rate: 10, period: MINUTE, capacity: 3 },
+});
+
+// Restrict how fast free users can sign up to deter bots
+const status = await rateLimiter.limit(ctx, "freeTrialSignUp");
+
+// Limit how fast a user can send messages
+const status = await rateLimiter.limit(ctx, "sendMessage", { key: userId });
+```
+
+<Note>
+  The rate limiter supports both **global rate limits** (singleton limits that apply to all users) and **keyed rate limits** (per-user, per-team, per-session, etc.)
+</Note>
+
+## Prerequisites
+
+Before using the Convex Rate Limiter component, you need:
+
+- **A Convex project** - Convex is a hosted backend platform that includes a database, serverless functions, and much more. If you don't have a Convex project yet:
+  - Run `npm create convex` to create a new project, or
+  - Follow the [Convex quickstarts](https://docs.convex.dev/home) to set one up
+
+- **Convex version 1.24.8 or higher** - The rate limiter component requires this minimum version
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install and configure the rate limiter component
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get started with a step-by-step guide
+  </Card>
+</CardGroup>

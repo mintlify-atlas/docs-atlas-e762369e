@@ -1,0 +1,251 @@
+---
+title: Per-User Limits
+description: Use the key parameter to create per-user, per-session, or per-team rate limits
+---
+
+## Overview
+
+While global rate limits apply to all requests, per-user rate limits allow you to enforce limits specific to individual users, sessions, teams, or any other identifier.
+
+## Using the key Parameter
+
+Pass a `key` to `limit()` to create an isolated rate limit for that specific key:
+
+```ts
+const status = await rateLimiter.limit(ctx, "sendMessage", { 
+  key: userId 
+});
+```
+
+Each unique key gets its own independent rate limit bucket.
+
+## Per-User Rate Limiting
+
+The most common pattern is to rate limit actions per authenticated user:
+
+```ts
+import { RateLimiter, MINUTE } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+import { mutation } from "./_generated/server";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  sendMessage: { kind: "token bucket", rate: 10, period: MINUTE, capacity: 3 },
+});
+
+export const sendMessage = mutation({
+  args: { text: v.string() },
+  handler: async (ctx, args) => {
+    const user = await ctx.auth.getUserIdentity();
+    if (!user) {
+      throw new Error("Not authenticated");
+    }
+    
+    // Each user has their own rate limit
+    const { ok } = await rateLimiter.limit(ctx, "sendMessage", { 
+      key: user.subject,
+      throws: true,
+    });
+    
+    // Save the message
+    await ctx.db.insert("messages", {
+      text: args.text,
+      userId: user.subject,
+      timestamp: Date.now(),
+    });
+  },
+});
+```
+
+## Real Example from Source Code
+
+Here's the actual example from the Convex Rate Limiter repository:
+
+```ts
+import { RateLimiter, MINUTE } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+import { mutation } from "./_generated/server";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Allows one message every ~6 seconds
+  // Allows up to 3 in quick succession if they haven't sent many recently
+  sendMessage: { kind: "token bucket", rate: 10, period: MINUTE, capacity: 3 },
+});
+
+export const consumeTokens = mutation({
+  args: {
+    count: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const user = await ctx.auth.getUserIdentity();
+    const key = user?.subject ?? "anonymous";
+    
+    return rateLimiter.limit(ctx, "demoLimit", {
+      count: args.count || 1,
+      key,
+    });
+  },
+});
+```
+
+## Per-Session Rate Limiting
+
+For rate limiting based on browser sessions or devices:
+
+```ts
+export const makeRequest = mutation({
+  args: { sessionId: v.string() },
+  handler: async (ctx, args) => {
+    await rateLimiter.limit(ctx, "apiRequest", { 
+      key: args.sessionId,
+      throws: true,
+    });
+    
+    // Process request
+  },
+});
+```
+
+## Per-Team Rate Limiting
+
+For multi-tenant applications where rate limits apply per team or organization:
+
+```ts
+export const exportData = mutation({
+  args: { teamId: v.id("teams") },
+  handler: async (ctx, args) => {
+    // Verify user has access to the team
+    const team = await ctx.db.get(args.teamId);
+    if (!team) {
+      throw new Error("Team not found");
+    }
+    
+    // Rate limit per team
+    await rateLimiter.limit(ctx, "dataExport", { 
+      key: args.teamId,
+      throws: true,
+    });
+    
+    // Export team data
+  },
+});
+```
+
+## Combining with Authentication
+
+Common patterns for authenticated vs anonymous users:
+
+### Fallback to Anonymous
+
+```ts
+const user = await ctx.auth.getUserIdentity();
+const key = user?.subject ?? "anonymous";
+
+await rateLimiter.limit(ctx, "action", { key });
+```
+
+### Stricter Limits for Anonymous Users
+
+<Tabs>
+  <Tab title="Separate Rate Limits">
+    ```ts
+    const rateLimiter = new RateLimiter(components.rateLimiter, {
+      authenticatedRequest: { kind: "token bucket", rate: 100, period: MINUTE },
+      anonymousRequest: { kind: "token bucket", rate: 10, period: MINUTE },
+    });
+    
+    export const makeRequest = mutation({
+      handler: async (ctx) => {
+        const user = await ctx.auth.getUserIdentity();
+        
+        if (user) {
+          await rateLimiter.limit(ctx, "authenticatedRequest", { 
+            key: user.subject,
+            throws: true,
+          });
+        } else {
+          // Stricter limit for anonymous users
+          await rateLimiter.limit(ctx, "anonymousRequest", { 
+            throws: true 
+          });
+        }
+      },
+    });
+    ```
+  </Tab>
+  <Tab title="Custom Count">
+    ```ts
+    const user = await ctx.auth.getUserIdentity();
+    const count = user ? 1 : 10; // Anonymous requests count 10x more
+    
+    await rateLimiter.limit(ctx, "apiRequest", { 
+      key: user?.subject ?? "anonymous",
+      count,
+      throws: true,
+    });
+    ```
+  </Tab>
+</Tabs>
+
+## Key Best Practices
+
+<AccordionGroup>
+  <Accordion title="Use stable identifiers">
+    Keys should be stable and unique. Good choices:
+    - User IDs from your auth system
+    - Session IDs
+    - Team/organization IDs
+    - IP addresses (for anonymous users)
+    
+    Avoid:
+    - Usernames (can change)
+    - Email addresses (can change)
+    - Display names
+  </Accordion>
+  
+  <Accordion title="Sanitize user-provided keys">
+    If the key comes from user input, validate it:
+    
+    ```ts
+    if (args.teamId.length > 100) {
+      throw new Error("Invalid team ID");
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Consider key cardinality">
+    Each unique key creates a separate rate limit bucket in the database. Be mindful of:
+    - How many unique keys you'll have
+    - Whether old keys can be cleaned up
+    - Storage implications for high-cardinality keys
+  </Accordion>
+</AccordionGroup>
+
+## Testing Different Keys
+
+From the source code's test suite:
+
+```ts
+export const test = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    // User 1 can consume tokens
+    const first = await rateLimiter.limit(ctx, "sendMessage", {
+      key: "user1",
+      throws: true,
+    });
+    assert(first.ok);
+    
+    // User 2 has their own independent limit
+    const user2 = await rateLimiter.limit(ctx, "sendMessage", {
+      key: "user2",
+    });
+    assert(user2.ok);
+  },
+});
+```
+
+## Next Steps
+
+- Learn about [Custom Counts](/usage/custom-counts) for non-uniform consumption
+- Understand [Error Handling](/usage/error-handling) with `throws`
+- Explore [Checking Limits](/usage/checking-limits) without consuming tokens

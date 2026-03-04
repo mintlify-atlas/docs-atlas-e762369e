@@ -1,0 +1,428 @@
+---
+title: React Hooks
+description: Check rate limits in your React components with the useRateLimit hook
+---
+
+## Overview
+
+The `useRateLimit` hook allows you to check rate limit status directly in your React components. This enables you to:
+
+- Show real-time rate limit status to users
+- Disable buttons when rate limited
+- Display countdown timers until retry is available
+- Provide better UX by checking limits client-side before sending requests
+
+## Setting Up the Server API
+
+First, create server queries using `hookAPI()` to expose your rate limits:
+
+```ts
+// In convex/rateLimit.ts
+import { RateLimiter, MINUTE } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  sendMessage: { kind: "token bucket", rate: 10, period: MINUTE, capacity: 3 },
+});
+
+// Export the hook API functions
+export const { getRateLimit, getServerTime } = rateLimiter.hookAPI(
+  "sendMessage",
+  {
+    // Optionally provide a key function
+    key: async (ctx) => {
+      const identity = await ctx.auth.getUserIdentity();
+      if (!identity) throw new Error("Not authenticated");
+      return identity.subject;
+    },
+  },
+);
+```
+
+### Server API Options
+
+The `hookAPI` method accepts two parameters:
+
+1. **name** (string): The rate limit name from your RateLimiter definition
+2. **options** (optional):
+   - `key`: String or async function to determine the rate limit key
+   - `sampleShards`: Number of shards to sample (if using sharding)
+
+### Key Function Patterns
+
+#### 1. Server-Determined Key
+
+```ts
+export const { getRateLimit, getServerTime } = rateLimiter.hookAPI(
+  "sendMessage",
+  {
+    // Server determines the key from auth context
+    key: async (ctx) => await getUserId(ctx),
+  },
+);
+```
+
+#### 2. Client-Provided Key with Validation
+
+```ts
+export const { getRateLimit, getServerTime } = rateLimiter.hookAPI(
+  "sendMessage",
+  {
+    // Client provides key, server validates access
+    key: async (ctx, keyFromClient) => {
+      await ensureUserCanUseKey(ctx, keyFromClient);
+      return keyFromClient;
+    },
+  },
+);
+```
+
+#### 3. Static Key
+
+```ts
+export const { getRateLimit, getServerTime } = rateLimiter.hookAPI(
+  "globalLimit",
+  {
+    // Use a fixed key for global rate limits
+    key: "global",
+  },
+);
+```
+
+## The getServerTime Mutation
+
+The `hookAPI` returns a `getServerTime` mutation that helps synchronize client and server clocks:
+
+```ts
+export const { getRateLimit, getServerTime } = rateLimiter.hookAPI("sendMessage");
+```
+
+From the source code (`client/index.ts:264-270`):
+
+```ts
+getServerTime: mutationGeneric({
+  args: {},
+  returns: v.number(),
+  handler: async () => {
+    return Date.now();
+  },
+}),
+```
+
+This ensures accurate `retryAt` calculations even when client and server clocks differ.
+
+## Using the Hook in React
+
+### Basic Usage
+
+```tsx
+import { useRateLimit } from "@convex-dev/rate-limiter/react";
+import { api } from "../convex/_generated/api";
+
+function SendMessageButton() {
+  const { status, check } = useRateLimit(api.rateLimit.getRateLimit, {
+    // Recommended: sync client and server clocks
+    getServerTimeMutation: api.rateLimit.getServerTime,
+    // Number of tokens to check for
+    count: 1,
+  });
+
+  if (!status) {
+    return <button disabled>Loading...</button>;
+  }
+
+  return (
+    <button disabled={!status.ok}>
+      {status.ok ? "Send Message" : `Wait ${getCountdown(status.retryAt)}s`}
+    </button>
+  );
+}
+
+function getCountdown(retryAt: number | undefined) {
+  if (!retryAt) return 0;
+  return Math.ceil((retryAt - Date.now()) / 1000);
+}
+```
+
+### Hook Options
+
+The `useRateLimit` hook accepts these options:
+
+```ts
+export type UseRateLimitOptions = {
+  name?: string;                      // Override rate limit name
+  key?: string;                       // Client-provided key (if server allows)
+  count?: number;                     // Tokens to check (default: 1)
+  sampleShards?: number;              // Shards to sample (if sharded)
+  getServerTimeMutation?: GetServerTimeMutation;  // For clock sync
+  config?: RateLimitConfig;           // Inline config (advanced)
+};
+```
+
+### Return Value
+
+The hook returns:
+
+```ts
+{
+  status: {
+    ok: boolean;           // true if rate limit allows the request
+    retryAt?: number;      // Client timestamp when retry is allowed
+  } | undefined,
+  check: (ts?: number, count?: number) => CheckResult | undefined
+}
+```
+
+## The check() Function
+
+Use `check()` to get detailed rate limit information at specific times:
+
+```tsx
+function DetailedStatus() {
+  const { status, check } = useRateLimit(api.rateLimit.getRateLimit, {
+    getServerTimeMutation: api.rateLimit.getServerTime,
+  });
+
+  // Check the status right now
+  const current = check(Date.now(), 1);
+  
+  if (!current) return <div>Loading...</div>;
+
+  return (
+    <div>
+      <p>Available tokens: {current.value}</p>
+      <p>Status: {current.ok ? "Ready" : "Rate limited"}</p>
+      {current.retryAt && (
+        <p>Retry at: {new Date(current.retryAt).toLocaleTimeString()}</p>
+      )}
+    </div>
+  );
+}
+```
+
+From the source (`react/index.ts:81-103`):
+
+```ts
+const check = useCallback(
+  (ts?: number, count?: number) => {
+    if (!rateLimitData) return undefined;
+
+    const clientTime = ts ?? Date.now();
+    const serverTime = clientTime + timeOffset;
+    const value = calculateRateLimit(
+      rateLimitData,
+      rateLimitData.config,
+      serverTime,
+      count,
+    );
+    return {
+      value: value.value,
+      ts: value.ts - timeOffset,
+      config: rateLimitData.config,
+      shard: rateLimitData.shard,
+      ok: value.value >= 0,
+      retryAt: value.retryAfter
+        ? serverTime + value.retryAfter - timeOffset
+        : undefined,
+    };
+  },
+  [rateLimitData, timeOffset],
+);
+```
+
+## Complete Example: Message Sender
+
+```tsx
+import { useState } from "react";
+import { useMutation } from "convex/react";
+import { useRateLimit } from "@convex-dev/rate-limiter/react";
+import { api } from "../convex/_generated/api";
+
+function MessageInput() {
+  const [message, setMessage] = useState("");
+  const sendMessage = useMutation(api.messages.send);
+  
+  const { status, check } = useRateLimit(api.rateLimit.getRateLimit, {
+    getServerTimeMutation: api.rateLimit.getServerTime,
+    count: 1,
+  });
+
+  const handleSend = async () => {
+    if (!status?.ok) return;
+    
+    try {
+      await sendMessage({ content: message });
+      setMessage("");
+    } catch (error) {
+      console.error("Failed to send:", error);
+    }
+  };
+
+  const countdown = status?.retryAt
+    ? Math.ceil((status.retryAt - Date.now()) / 1000)
+    : 0;
+
+  return (
+    <div>
+      <input
+        value={message}
+        onChange={(e) => setMessage(e.target.value)}
+        placeholder="Type a message..."
+      />
+      <button
+        onClick={handleSend}
+        disabled={!status?.ok || !message}
+      >
+        {status?.ok ? "Send" : `Wait ${countdown}s`}
+      </button>
+      
+      {/* Show token count */}
+      <RateLimitStatus check={check} />
+    </div>
+  );
+}
+
+function RateLimitStatus({ check }: { check: Function }) {
+  const current = check(Date.now(), 0);
+  
+  if (!current) return null;
+  
+  return (
+    <div style={{ fontSize: "0.8em", color: "#666" }}>
+      Available: {Math.max(0, current.value)} tokens
+    </div>
+  );
+}
+```
+
+## Auto-Refreshing Status
+
+The hook automatically refreshes when the rate limit recovers:
+
+From the source (`react/index.ts:119-123`):
+
+```ts
+useEffect(() => {
+  if (ret?.status?.ok !== false) return;
+  const interval = setTimeout(refresh, ret.status.retryAt - Date.now());
+  return () => clearTimeout(interval);
+}, [ret?.status?.ok, ret?.status?.retryAt, refresh]);
+```
+
+The component automatically re-renders when `retryAt` is reached.
+
+## Countdown Timer Example
+
+```tsx
+function CountdownTimer({ retryAt }: { retryAt?: number }) {
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    if (!retryAt) return;
+    
+    const interval = setInterval(() => {
+      setNow(Date.now());
+    }, 100);
+    
+    return () => clearInterval(interval);
+  }, [retryAt]);
+
+  if (!retryAt || now >= retryAt) return null;
+
+  const seconds = Math.ceil((retryAt - now) / 1000);
+  return <span>Retry in {seconds}s</span>;
+}
+
+function MyComponent() {
+  const { status } = useRateLimit(api.rateLimit.getRateLimit, {
+    getServerTimeMutation: api.rateLimit.getServerTime,
+  });
+
+  return (
+    <button disabled={!status?.ok}>
+      {status?.ok ? "Click me" : <CountdownTimer retryAt={status?.retryAt} />}
+    </button>
+  );
+}
+```
+
+## Multiple Token Check
+
+Check if enough tokens are available for different actions:
+
+```tsx
+function BulkActions() {
+  const { check } = useRateLimit(api.rateLimit.getRateLimit, {
+    getServerTimeMutation: api.rateLimit.getServerTime,
+  });
+
+  // Check different token counts
+  const canSendOne = check(Date.now(), 1)?.ok;
+  const canSendFive = check(Date.now(), 5)?.ok;
+  const canSendTen = check(Date.now(), 10)?.ok;
+
+  return (
+    <div>
+      <button disabled={!canSendOne}>Send 1 message</button>
+      <button disabled={!canSendFive}>Send 5 messages</button>
+      <button disabled={!canSendTen}>Send 10 messages</button>
+    </div>
+  );
+}
+```
+
+## Client-Provided Keys
+
+When the server allows client-provided keys:
+
+```tsx
+function TeamRateLimitStatus({ teamId }: { teamId: string }) {
+  const { status } = useRateLimit(api.rateLimit.getTeamRateLimit, {
+    key: teamId,  // Client provides the key
+    getServerTimeMutation: api.rateLimit.getServerTime,
+  });
+
+  return (
+    <div>
+      Team rate limit: {status?.ok ? "Available" : "Exhausted"}
+    </div>
+  );
+}
+```
+
+## Best Practices
+
+1. **Always use getServerTimeMutation**: Ensures accurate retry times even with clock skew
+2. **Handle loading state**: The hook returns `undefined` while loading
+3. **Show countdown timers**: Give users feedback on when they can retry
+4. **Check before actions**: Use the hook to enable/disable UI elements
+5. **Combine with server checks**: Client-side checks are advisory; always check server-side too
+
+<Warning>
+  **Client-side checks are not security**: Always enforce rate limits on the server. The React hook is for UX only.
+</Warning>
+
+## Type Safety
+
+The hook is fully typed with TypeScript:
+
+```ts
+type UseRateLimitReturn = {
+  status: {
+    ok: boolean;
+    retryAt?: number;
+  } | undefined;
+  check: (ts?: number, count?: number) => {
+    value: number;
+    ts: number;
+    config: RateLimitConfig;
+    shard: number;
+    ok: boolean;
+    retryAt?: number;
+  } | undefined;
+};
+```
+
+<Note>
+  For more on rate limiting patterns, see [Dynamic Limits](/advanced/dynamic-limits) for runtime configuration and [Jitter](/advanced/jitter) for handling burst traffic.
+</Note>

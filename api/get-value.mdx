@@ -1,0 +1,296 @@
+---
+title: getValue()
+description: Get current rate limit state and metadata
+---
+
+## Overview
+
+The `getValue()` method returns the current state of a rate limit without consuming any tokens. It provides detailed information including the current token value, timestamp, shard number, and configuration.
+
+## Method Signature
+
+```typescript
+async getValue<Name extends string = keyof Limits & string>(
+  ctx: RunQueryCtx,
+  name: Name,
+  ...options: Name extends keyof Limits & string
+    ? [
+        WithKnownNameOrInlinedConfig<
+          Limits,
+          Name,
+          {
+            key?: string;
+            sampleShards?: number;
+          }
+        >?,
+      ]
+    : [
+        WithKnownNameOrInlinedConfig<
+          Limits,
+          Name,
+          {
+            key?: string;
+            sampleShards?: number;
+          }
+        >,
+      ]
+): Promise<GetValueReturns>
+```
+
+## Parameters
+
+<ParamField path="ctx" type="RunQueryCtx" required>
+  The context object from a query, including `runQuery`. This method works in both queries and mutations.
+</ParamField>
+
+<ParamField path="name" type="string" required>
+  The name of the rate limit to query.
+</ParamField>
+
+<ParamField path="options" type="object">
+  Optional configuration for retrieving the value.
+  
+  <ParamField path="key" type="string">
+    The key for the rate limit instance. If not provided, retrieves the shared global rate limit value.
+  </ParamField>
+  
+  <ParamField path="sampleShards" type="number">
+    For sharded rate limits, the number of shards to sample. This affects which shard's data is returned. Useful for debugging or monitoring specific shards.
+  </ParamField>
+  
+  <ParamField path="config" type="RateLimitConfig">
+    The rate limit configuration. Required only if the rate limit name was not defined in the `RateLimiter` constructor.
+  </ParamField>
+</ParamField>
+
+## Return Type
+
+<ResponseField name="GetValueReturns" type="object">
+  Returns an object with the following properties:
+  
+  <ResponseField name="value" type="number" required>
+    The current number of available tokens. This can be a decimal for token bucket rate limits.
+  </ResponseField>
+  
+  <ResponseField name="ts" type="number" required>
+    The timestamp (in milliseconds) of when this value was last updated. For token bucket, this is the last refill time. For fixed window, this is the start of the current window.
+  </ResponseField>
+  
+  <ResponseField name="shard" type="number" required>
+    The shard number that this data came from. Useful for sharded rate limits to understand which shard is being used.
+  </ResponseField>
+  
+  <ResponseField name="config" type="RateLimitConfig" required>
+    The complete rate limit configuration for this limit, including all settings like `kind`, `rate`, `period`, `capacity`, etc.
+  </ResponseField>
+</ResponseField>
+
+## Use with calculateRateLimit
+
+The `getValue()` method pairs perfectly with the `calculateRateLimit` helper function for client-side rate limit tracking:
+
+```typescript
+import { query } from "./_generated/server";
+import { rateLimiter } from "./rateLimiter";
+
+export const getMessageLimitStatus = query({
+  handler: async (ctx) => {
+    const userId = await getCurrentUser(ctx);
+    
+    return await rateLimiter.getValue(ctx, "sendMessage", {
+      key: userId,
+    });
+  },
+});
+```
+
+Then on the client:
+
+```typescript
+import { calculateRateLimit } from "@convex-dev/rate-limiter";
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function MessageComposer() {
+  const limitStatus = useQuery(api.messages.getMessageLimitStatus);
+  
+  if (!limitStatus) return null;
+  
+  // Calculate current state on the client
+  const current = calculateRateLimit(
+    { value: limitStatus.value, ts: limitStatus.ts },
+    limitStatus.config,
+    Date.now()
+  );
+  
+  return (
+    <div>
+      <p>Available tokens: {Math.floor(current.value)}</p>
+      {current.retryAfter && (
+        <p>Next token in: {Math.ceil(current.retryAfter / 1000)}s</p>
+      )}
+    </div>
+  );
+}
+```
+
+## Examples
+
+### Basic Usage
+
+```typescript
+import { query } from "./_generated/server";
+import { rateLimiter } from "./rateLimiter";
+
+export const checkApiQuota = query({
+  handler: async (ctx) => {
+    const userId = await getCurrentUser(ctx);
+    
+    const status = await rateLimiter.getValue(ctx, "apiCalls", {
+      key: userId,
+    });
+    
+    return {
+      available: Math.floor(status.value),
+      lastUpdated: new Date(status.ts).toISOString(),
+      config: status.config,
+    };
+  },
+});
+```
+
+### Monitoring Dashboard
+
+```typescript
+export const getRateLimitStats = query({
+  handler: async (ctx) => {
+    await requireAdmin(ctx);
+    
+    // Get stats for multiple rate limits
+    const sendMessageGlobal = await rateLimiter.getValue(
+      ctx,
+      "sendMessage"
+    );
+    const signupGlobal = await rateLimiter.getValue(ctx, "freeTrialSignUp");
+    
+    return {
+      sendMessage: {
+        available: sendMessageGlobal.value,
+        shard: sendMessageGlobal.shard,
+      },
+      signup: {
+        available: signupGlobal.value,
+        shard: signupGlobal.shard,
+      },
+    };
+  },
+});
+```
+
+### User Quota Display
+
+```typescript
+export const getUserQuotas = query({
+  handler: async (ctx) => {
+    const userId = await getCurrentUser(ctx);
+    
+    const [messages, uploads] = await Promise.all([
+      rateLimiter.getValue(ctx, "sendMessage", { key: userId }),
+      rateLimiter.getValue(ctx, "upload", { key: userId }),
+    ]);
+    
+    return {
+      messages: {
+        available: Math.floor(messages.value),
+        max: messages.config.capacity ?? messages.config.rate,
+        refillRate: `${messages.config.rate} per ${messages.config.period}ms`,
+      },
+      uploads: {
+        available: Math.floor(uploads.value),
+        max: uploads.config.capacity ?? uploads.config.rate,
+      },
+    };
+  },
+});
+```
+
+### Debug Specific Shard
+
+```typescript
+export const debugRateLimitShard = query({
+  args: { shardNumber: v.number() },
+  handler: async (ctx, args) => {
+    await requireAdmin(ctx);
+    
+    const status = await rateLimiter.getValue(ctx, "sendMessage", {
+      sampleShards: args.shardNumber,
+    });
+    
+    return {
+      shard: status.shard,
+      value: status.value,
+      timestamp: status.ts,
+      age: Date.now() - status.ts,
+      config: status.config,
+    };
+  },
+});
+```
+
+### Calculate Time Until Next Token
+
+```typescript
+import { calculateRateLimit } from "@convex-dev/rate-limiter";
+
+export const getTimeUntilNextToken = query({
+  handler: async (ctx) => {
+    const userId = await getCurrentUser(ctx);
+    const status = await rateLimiter.getValue(ctx, "sendMessage", {
+      key: userId,
+    });
+    
+    // Use calculateRateLimit to project future state
+    const current = calculateRateLimit(
+      { value: status.value, ts: status.ts },
+      status.config,
+      Date.now()
+    );
+    
+    if (current.value >= 1) {
+      return { ready: true };
+    }
+    
+    return {
+      ready: false,
+      waitMs: current.retryAfter,
+      currentTokens: current.value,
+    };
+  },
+});
+```
+
+## Notes
+
+<Note>
+  Unlike `check()`, which evaluates whether an action would be allowed, `getValue()` returns the raw state data. Use `getValue()` when you need to display quota information or perform custom calculations.
+</Note>
+
+<Note>
+  The `value` returned can be a decimal number for token bucket rate limits, as tokens accumulate gradually over time. Use `Math.floor()` if you need a whole number.
+</Note>
+
+<Note>
+  For rate limits that haven't been used yet, `getValue()` will return the initial state with full capacity.
+</Note>
+
+<Warning>
+  The `ts` field has different meanings depending on the rate limit type:
+  - **Token bucket**: The last time tokens were calculated/updated
+  - **Fixed window**: The start time of the current window
+</Warning>
+
+## Related
+
+- [`check()`](/api/check) - Check if an action would be allowed
+- [`limit()`](/api/limit) - Consume tokens
+- [calculateRateLimit](/api/utilities) - Client-side state calculation

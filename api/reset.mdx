@@ -1,0 +1,188 @@
+---
+title: reset()
+description: Reset a rate limit to its initial state
+---
+
+## Overview
+
+The `reset()` method removes a rate limit from the database, resetting it to its initial state. The next request will start fresh with full capacity.
+
+## Method Signature
+
+```typescript
+async reset<Name extends string = keyof Limits & string>(
+  { runMutation }: RunMutationCtx,
+  name: Name,
+  args?: { key?: string }
+): Promise<void>
+```
+
+## Parameters
+
+<ParamField path="ctx" type="RunMutationCtx" required>
+  The context object from a mutation, including `runMutation`. Only the `runMutation` property is used, so you can destructure it: `{ runMutation }`.
+</ParamField>
+
+<ParamField path="name" type="string" required>
+  The name of the rate limit to reset. This will reset all shards for this rate limit name.
+</ParamField>
+
+<ParamField path="args" type="object">
+  Optional arguments to specify which rate limit instance to reset.
+  
+  <ParamField path="key" type="string">
+    If provided, resets only the rate limit for this specific key (e.g., a specific user). If not provided, resets the shared global rate limit for this name.
+  </ParamField>
+</ParamField>
+
+## Return Type
+
+<ResponseField name="void" type="Promise<void>">
+  Returns a promise that resolves when the reset is complete. No value is returned.
+</ResponseField>
+
+## When to Use
+
+The `reset()` method is useful in several scenarios:
+
+- **User upgrades** - Reset limits when a user upgrades to a premium plan
+- **Administrative actions** - Manually clear rate limits for support purposes
+- **Testing** - Reset limits between test runs
+- **Abuse mitigation** - Clear limits after resolving a security incident
+- **Forgiveness** - Give users a fresh start after explaining the limits
+
+## Examples
+
+### Reset Global Rate Limit
+
+```typescript
+import { mutation } from "./_generated/server";
+import { rateLimiter } from "./rateLimiter";
+
+export const resetGlobalSignups = mutation({
+  handler: async (ctx) => {
+    // Reset the shared signup limit
+    await rateLimiter.reset(ctx, "freeTrialSignUp");
+  },
+});
+```
+
+### Reset User-Specific Rate Limit
+
+```typescript
+export const resetUserMessageLimit = mutation({
+  args: { userId: v.string() },
+  handler: async (ctx, args) => {
+    // Verify admin permissions
+    await requireAdmin(ctx);
+    
+    // Reset this specific user's message limit
+    await rateLimiter.reset(ctx, "sendMessage", {
+      key: args.userId,
+    });
+  },
+});
+```
+
+### Reset on Subscription Upgrade
+
+```typescript
+export const upgradeToPremium = mutation({
+  args: { userId: v.string() },
+  handler: async (ctx, args) => {
+    // Update user's subscription
+    await ctx.db.patch(args.userId, { tier: "premium" });
+    
+    // Reset their rate limits to give them a fresh start
+    await rateLimiter.reset(ctx, "apiCalls", { key: args.userId });
+    await rateLimiter.reset(ctx, "upload", { key: args.userId });
+  },
+});
+```
+
+### Admin Tool with Key Selection
+
+```typescript
+export const adminResetLimit = mutation({
+  args: {
+    limitName: v.string(),
+    userId: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    await requireAdmin(ctx);
+    
+    if (args.userId) {
+      // Reset for specific user
+      await rateLimiter.reset(ctx, args.limitName, {
+        key: args.userId,
+      });
+    } else {
+      // Reset global limit
+      await rateLimiter.reset(ctx, args.limitName);
+    }
+    
+    // Log the action
+    await ctx.db.insert("auditLog", {
+      action: "rate_limit_reset",
+      limitName: args.limitName,
+      userId: args.userId,
+      adminId: ctx.userId,
+      timestamp: Date.now(),
+    });
+  },
+});
+```
+
+### Testing Utility
+
+```typescript
+import { test } from "convex-test";
+import { rateLimiter } from "./rateLimiter";
+
+test("rate limiter behavior", async () => {
+  const t = convexTest(schema);
+  
+  // Set up test
+  await rateLimiter.limit(t.mutation, "testLimit", { key: "user123" });
+  await rateLimiter.limit(t.mutation, "testLimit", { key: "user123" });
+  
+  // Reset for next test
+  await rateLimiter.reset(t.mutation, "testLimit", { key: "user123" });
+  
+  // Verify reset worked
+  const status = await rateLimiter.check(t.query, "testLimit", {
+    key: "user123",
+  });
+  expect(status.ok).toBe(true);
+});
+```
+
+## Side Effects
+
+<Warning>
+  Resetting a rate limit immediately removes all tracking data for that limit. Any tokens that were consumed or reserved are forgotten, and the limit starts fresh with full capacity.
+</Warning>
+
+<Note>
+  For **fixed window** rate limits without a specified `start` time, resetting will cause the new window to begin at a random time. The window alignment will be different after the reset.
+</Note>
+
+<Note>
+  The `reset()` method affects all shards for the specified rate limit name. With sharded rate limits, all shards are deleted and will be recreated on the next request.
+</Note>
+
+## Notes
+
+<Note>
+  Resetting a rate limit that doesn't exist (never been used) is a no-op. It doesn't throw an error.
+</Note>
+
+<Warning>
+  Use `reset()` carefully in production. Resetting limits could allow users to bypass intended restrictions. Always verify authorization before allowing resets.
+</Warning>
+
+## Related Methods
+
+- [`limit()`](/api/limit) - Enforce rate limits
+- [`getValue()`](/api/get-value) - Check current state before resetting
+- [`check()`](/api/check) - Verify reset was successful

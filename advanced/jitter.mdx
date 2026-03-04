@@ -1,0 +1,315 @@
+---
+title: Adding Jitter
+description: Use randomness to prevent thundering herd problems and distribute retry traffic
+---
+
+## What is Jitter?
+
+Jitter is the technique of adding randomness to retry timing. Instead of all rate-limited clients retrying at exactly the same time, jitter spreads retries across a time window.
+
+This prevents the [thundering herd problem](https://en.wikipedia.org/wiki/Thundering_herd_problem) where synchronized retries cause traffic spikes.
+
+## The Thundering Herd Problem
+
+Without jitter, rate-limited clients retry simultaneously:
+
+```ts
+const status = await rateLimiter.limit(ctx, "api");
+if (!status.ok) {
+  // Problem: All clients wait exactly retryAfter ms
+  await new Promise(resolve => setTimeout(resolve, status.retryAfter));
+  // All clients retry at the SAME TIME
+}
+```
+
+This creates:
+- **Network congestion**: Burst of simultaneous requests
+- **Database contention**: High OCC conflicts
+- **Resource spikes**: CPU and memory usage peaks
+- **Cascading failures**: The spike might trigger more rate limits
+
+## Solution: Add Jitter to Retries
+
+Add randomness to the retry delay:
+
+```ts
+const status = await rateLimiter.limit(ctx, "api");
+if (!status.ok) {
+  // Add jitter: retry within the next period
+  const jitter = Math.random() * period;
+  const retryAfter = status.retryAfter + jitter;
+  
+  await new Promise(resolve => setTimeout(resolve, retryAfter));
+  // Clients now retry at different times
+}
+```
+
+## Jitter Strategies
+
+### 1. Full Jitter
+
+Randomize across the entire retry window:
+
+```ts
+import { MINUTE } from "@convex-dev/rate-limiter";
+
+const status = await rateLimiter.limit(ctx, "sendMessage");
+if (!status.ok) {
+  // Spread retries across the next minute
+  const retryAfter = status.retryAfter + Math.random() * MINUTE;
+  // ...
+}
+```
+
+### 2. Proportional Jitter
+
+Add jitter proportional to the wait time:
+
+```ts
+const status = await rateLimiter.limit(ctx, "api");
+if (!status.ok) {
+  // Add 0-50% randomness to retry time
+  const jitter = status.retryAfter * 0.5 * Math.random();
+  const retryAfter = status.retryAfter + jitter;
+  // ...
+}
+```
+
+### 3. Decorrelated Jitter
+
+Use the previous retry time to calculate the next:
+
+```ts
+let previousRetry = 0;
+
+const status = await rateLimiter.limit(ctx, "api");
+if (!status.ok) {
+  // Decorrelated jitter based on previous attempt
+  const retryAfter = Math.min(
+    maxDelay,
+    Math.random() * (previousRetry * 3)
+  );
+  previousRetry = retryAfter;
+  // ...
+}
+```
+
+## Fixed Window: Automatic Jitter
+
+The `fixed window` strategy includes built-in jitter for the window start time:
+
+```ts
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // The window start time is randomized automatically
+  apiRequests: { kind: "fixed window", rate: 100, period: MINUTE },
+});
+```
+
+From the README:
+
+> For the fixed window, we also introduce randomness by picking the start time of the window (from which all subsequent windows are based) randomly if config.start wasn't provided. This helps from all clients flooding requests at midnight and paging you.
+
+From the source code (`shared.ts:146-149`):
+
+```ts
+ts: config.kind === "fixed window"
+  ? config.start ?? now - Math.floor(Math.random() * config.period)
+  : now,
+```
+
+The window start is randomized within the period, distributing resets across time.
+
+## Custom Window Start
+
+You can specify an exact window start time to control reset timing:
+
+```ts
+import { HOUR } from "@convex-dev/rate-limiter";
+
+// Reset at midnight UTC every day
+const midnightUTC = new Date();
+midnightUTC.setUTCHours(0, 0, 0, 0);
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  dailyLimit: {
+    kind: "fixed window",
+    rate: 1000,
+    period: 24 * HOUR,
+    start: midnightUTC.getTime(),
+  },
+});
+```
+
+<Warning>
+  **Caution**: Using a fixed `start` time means all clients reset simultaneously. Only use this when you specifically need synchronized resets (like daily quotas).
+</Warning>
+
+## Client-Side Retry Pattern
+
+Implementing jittered retries on the client:
+
+```ts
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+function MyComponent() {
+  const sendMessage = useMutation(api.messages.send);
+  
+  const sendWithRetry = async (content: string) => {
+    try {
+      await sendMessage({ content });
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        const { retryAfter } = error.data;
+        
+        // Add jitter to prevent thundering herd
+        const jitter = Math.random() * 5000; // 0-5 seconds
+        const delay = retryAfter + jitter;
+        
+        console.log(`Rate limited. Retrying in ${delay}ms`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        
+        // Retry the operation
+        return sendWithRetry(content);
+      }
+      throw error;
+    }
+  };
+  
+  return (
+    <button onClick={() => sendWithRetry("Hello!")}>
+      Send Message
+    </button>
+  );
+}
+```
+
+## Server-Side Retry with Scheduler
+
+Use `ctx.scheduler` with jitter for server-side retries:
+
+```ts
+import { internalAction } from "./_generated/server";
+import { internal } from "./_generated/api";
+
+export const processWithRetry = internalAction({
+  args: { data: v.any(), attempt: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const status = await rateLimiter.limit(ctx, "externalAPI");
+    
+    if (!status.ok) {
+      const attempt = args.attempt ?? 0;
+      
+      if (attempt >= 5) {
+        throw new Error("Max retries exceeded");
+      }
+      
+      // Add jitter to retry time
+      const jitter = Math.random() * 10000; // 0-10 seconds
+      const delay = status.retryAfter + jitter;
+      
+      await ctx.scheduler.runAfter(
+        delay,
+        internal.operations.processWithRetry,
+        { ...args, attempt: attempt + 1 },
+      );
+      
+      return { status: "scheduled", attempt };
+    }
+    
+    // Process the operation
+    return { status: "complete" };
+  },
+});
+```
+
+## Jitter vs Reservations
+
+### Use Jitter When:
+- You want clients to retry independently
+- The order of operations doesn't matter
+- You're okay with some operations failing
+- You need simple retry logic
+
+### Use Reservations When:
+- You need guaranteed execution
+- Order matters (fair queueing)
+- You can't afford operation failures
+- You're dealing with large batch operations
+
+See the [Reservations guide](/advanced/reservations) for more on capacity reservation.
+
+## Complete Example
+
+```ts
+import { mutation, internalAction } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { RateLimiter, MINUTE } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Fixed window with automatic jitter
+  userActions: { kind: "fixed window", rate: 10, period: MINUTE },
+  
+  // Token bucket for smoother rate limiting
+  apiCalls: { kind: "token bucket", rate: 100, period: MINUTE },
+});
+
+export const performAction = mutation({
+  args: { userId: v.id("users"), action: v.string() },
+  handler: async (ctx, args) => {
+    const status = await rateLimiter.limit(ctx, "userActions", {
+      key: args.userId,
+    });
+    
+    if (!status.ok) {
+      // Add jitter and schedule retry
+      const jitter = Math.random() * 5000;
+      const delay = status.retryAfter + jitter;
+      
+      await ctx.scheduler.runAfter(
+        delay,
+        internal.actions.performActionInternal,
+        args,
+      );
+      
+      throw new ConvexError({
+        kind: "RateLimited",
+        message: `Please retry in ${Math.ceil(delay / 1000)}s`,
+        retryAfter: delay,
+      });
+    }
+    
+    // Perform the action
+    return { success: true };
+  },
+});
+
+export const performActionInternal = internalAction({
+  args: { userId: v.id("users"), action: v.string() },
+  handler: async (ctx, args) => {
+    // Retry without jitter (already applied when scheduling)
+    const status = await rateLimiter.limit(ctx, "userActions", {
+      key: args.userId,
+    });
+    
+    if (!status.ok) {
+      throw new Error("Still rate limited after retry");
+    }
+    
+    // Perform the action
+  },
+});
+```
+
+## Best Practices
+
+1. **Always add jitter**: Don't rely on clients retrying at the same time
+2. **Use appropriate jitter size**: Balance between spreading load and user experience
+3. **Combine with exponential backoff**: For repeated failures, increase delay exponentially
+4. **Consider using reservations**: For critical operations that must succeed
+5. **Monitor retry patterns**: Track jitter effectiveness in your metrics
+
+<Note>
+  Jitter is most effective when combined with other rate limiting strategies. See [Sharding](/advanced/sharding) for handling high throughput and [Reservations](/advanced/reservations) for preventing starvation.
+</Note>

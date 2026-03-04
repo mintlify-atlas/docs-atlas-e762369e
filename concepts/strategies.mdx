@@ -1,0 +1,188 @@
+---
+title: "Rate Limiting Strategies"
+description: "Overview of token bucket and fixed window rate limiting algorithms"
+---
+
+## Available Strategies
+
+The Convex Rate Limiter supports two proven rate limiting algorithms:
+
+1. **Token Bucket** - Continuously adds tokens over time, allowing smooth rate limiting with burst capacity
+2. **Fixed Window** - Grants tokens in bulk at fixed intervals, ideal for scheduled resets
+
+Both strategies support the same core features like sharding, reservation, and configurable capacity.
+
+## Token Bucket vs Fixed Window
+
+### When to Use Token Bucket
+
+The **token bucket** approach provides guarantees for overall consumption via the `rate` per `period` at which tokens are added, while also allowing unused tokens to accumulate (like "rollover" minutes) up to some `capacity` value.
+
+**Best for:**
+- Smooth, continuous rate limiting
+- LLM API rate limits (tokens are added continuously)
+- User messaging (allow bursts if they haven't been active)
+- Any scenario where you want gradual token replenishment
+
+**Example:** If you could normally send 10 per minute with a capacity of 20, then every two minutes you could send 20. Or if in the last two minutes you only sent 5, you can send 15 now.
+
+### When to Use Fixed Window
+
+The **fixed window** approach grants tokens all at once, every `period` milliseconds. It similarly allows accumulating "rollover" tokens up to a `capacity` (defaults to the `rate`).
+
+**Best for:**
+- Scheduled resets (e.g., daily quotas)
+- Aligning with external API windows
+- When you want predictable reset times
+- Burst allowance at specific intervals
+
+**Example:** With a rate of 100 per hour, users get 100 tokens at the start of each hour. Unused tokens can roll over up to the capacity.
+
+<Note>
+For fixed window, you can specify a custom `start` time if you want the period to reset at a specific time of day. By default it will be random to help space out requests that are retrying.
+</Note>
+
+## Key Differences
+
+| Feature | Token Bucket | Fixed Window |
+|---------|--------------|-------------|
+| Token addition | Continuous (calculated per millisecond) | Bulk (at window boundaries) |
+| Rate smoothing | Excellent - perfectly smooth | Moderate - can have bursts at boundaries |
+| Predictable resets | No - tokens always adding | Yes - resets at fixed intervals |
+| Best use case | Smooth traffic, LLM APIs | Scheduled quotas, daily limits |
+| `start` parameter | Not applicable (always null) | Optional timestamp for window alignment |
+
+## Configuration Options
+
+Both strategies share common configuration parameters:
+
+### Required Parameters
+
+```typescript
+{
+  kind: "token bucket" | "fixed window",
+  rate: number,    // Number of tokens per period
+  period: number,  // Time period in milliseconds
+}
+```
+
+### Optional Parameters
+
+#### `capacity`
+
+The maximum number of tokens that can accumulate. Defaults to `rate`.
+
+```typescript
+{
+  kind: "token bucket",
+  rate: 10,
+  period: MINUTE,
+  capacity: 20,  // Allow up to 20 tokens to accumulate
+}
+```
+
+<Info>
+Higher capacity allows more burst traffic but maintains the same long-term rate limit.
+</Info>
+
+#### `maxReserved`
+
+The maximum number of tokens that can be reserved ahead of time when using the `reserve` feature.
+
+```typescript
+{
+  kind: "token bucket",
+  rate: 100,
+  period: MINUTE,
+  maxReserved: 50,  // Can reserve up to 50 tokens into the future
+}
+```
+
+#### `shards`
+
+Number of shards to use for handling high throughput. See [Scaling with Shards](/advanced/sharding) for details.
+
+```typescript
+{
+  kind: "fixed window",
+  rate: 1000,
+  period: MINUTE,
+  shards: 10,  // Use 10 shards for high concurrency
+}
+```
+
+#### `start` (Fixed Window Only)
+
+Timestamp in UTC milliseconds for when the first window starts. All subsequent windows are calculated from this point.
+
+```typescript
+{
+  kind: "fixed window",
+  rate: 100,
+  period: HOUR,
+  start: Date.UTC(2024, 0, 1, 0, 0, 0),  // Reset at midnight UTC
+}
+```
+
+<Note>
+If `start` is not provided for fixed window, it will be a random number between 0 and `period` to help distribute load from retrying clients.
+</Note>
+
+## Type Definitions
+
+The rate limit configurations are defined using Convex validators:
+
+```typescript src/shared.ts
+// Token Bucket Configuration
+export const tokenBucketValidator = v.object({
+  kind: v.literal("token bucket"),
+  rate: v.number(),
+  period: v.number(),
+  capacity: v.optional(v.number()),
+  maxReserved: v.optional(v.number()),
+  shards: v.optional(v.number()),
+  start: v.optional(v.null()),
+});
+
+// Fixed Window Configuration
+export const fixedWindowValidator = v.object({
+  kind: v.literal("fixed window"),
+  rate: v.number(),
+  period: v.number(),
+  capacity: v.optional(v.number()),
+  maxReserved: v.optional(v.number()),
+  shards: v.optional(v.number()),
+  start: v.optional(v.number()),
+});
+```
+
+## Choosing the Right Strategy
+
+Use this decision tree:
+
+1. **Do you need tokens to be added continuously?**
+   - Yes → Token Bucket
+   - No → Continue to #2
+
+2. **Do you need predictable reset times?**
+   - Yes → Fixed Window
+   - No → Token Bucket (more flexible)
+
+3. **Are you rate limiting an external API?**
+   - LLM/streaming APIs → Token Bucket
+   - APIs with daily/hourly quotas → Fixed Window
+
+4. **Do you want the smoothest possible rate limiting?**
+   - Yes → Token Bucket
+   - Don't care → Either works
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Token Bucket Details" icon="bucket" href="/concepts/token-bucket">
+    Learn how token bucket works in detail
+  </Card>
+  <Card title="Fixed Window Details" icon="window" href="/concepts/fixed-window">
+    Learn how fixed window works in detail
+  </Card>
+</CardGroup>

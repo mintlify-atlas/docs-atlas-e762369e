@@ -1,0 +1,325 @@
+---
+title: "Message Rate Limiting"
+description: "Prevent spam with per-user message limits using token bucket for burst handling"
+---
+
+## The Problem
+
+Users sending messages too quickly can spam your application. You need to limit message frequency per user while allowing occasional bursts of legitimate activity.
+
+## Solution: Per-User Token Bucket
+
+Use a **per-user rate limit** with a **token bucket** strategy. This allows steady messaging (10 per minute) while permitting short bursts when users haven't been active.
+
+## Configuration
+
+```ts convex/rateLimits.ts
+import { RateLimiter, MINUTE } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Allow 10 messages per minute per user
+  // Capacity of 3 allows bursts of 3 messages if tokens are available
+  sendMessage: {
+    kind: "token bucket",
+    rate: 10,
+    period: MINUTE,
+    capacity: 3,
+  },
+});
+
+export { rateLimiter };
+```
+
+**How it works:**
+- Tokens refill at 10 per minute (one every ~6 seconds)
+- Maximum 3 tokens can accumulate
+- Each message consumes 1 token
+- If user hasn't sent messages recently, they can send 3 quickly
+
+## Implementation
+
+### Backend Mutation
+
+```ts convex/messages.ts
+import { v } from "convex/values";
+import { mutation } from "./_generated/server";
+import { rateLimiter } from "./rateLimits";
+
+export const send = mutation({
+  args: {
+    text: v.string(),
+    channelId: v.id("channels"),
+  },
+  handler: async (ctx, args) => {
+    // Get authenticated user
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      throw new Error("Not authenticated");
+    }
+
+    const userId = identity.subject;
+
+    // Check rate limit for this specific user
+    const { ok, retryAfter } = await rateLimiter.limit(
+      ctx,
+      "sendMessage",
+      { key: userId }
+    );
+
+    if (!ok) {
+      throw new Error(
+        `Rate limit exceeded. Please wait ${Math.ceil(retryAfter! / 1000)} seconds.`
+      );
+    }
+
+    // Send the message
+    const messageId = await ctx.db.insert("messages", {
+      text: args.text,
+      channelId: args.channelId,
+      userId,
+      timestamp: Date.now(),
+    });
+
+    return { success: true, messageId };
+  },
+});
+```
+
+### Query to Check Rate Limit Status
+
+```ts convex/messages.ts
+import { query } from "./_generated/server";
+
+export const getRateLimitStatus = query({
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) return null;
+
+    return rateLimiter.check(ctx, "sendMessage", {
+      key: identity.subject,
+    });
+  },
+});
+```
+
+## Client-Side Integration
+
+### With React Hook
+
+First, set up the hook API:
+
+```ts convex/messages.ts
+export const { getRateLimit, getServerTime } = rateLimiter.hookAPI(
+  "sendMessage",
+  {
+    key: async (ctx) => {
+      const user = await ctx.auth.getUserIdentity();
+      return user?.subject ?? "anonymous";
+    },
+  }
+);
+```
+
+Then use it in your component:
+
+```tsx src/MessageInput.tsx
+import { useMutation } from "convex/react";
+import { useRateLimit } from "@convex-dev/rate-limiter/react";
+import { api } from "../convex/_generated/api";
+import { useState, useEffect } from "react";
+
+export function MessageInput({ channelId }: { channelId: string }) {
+  const sendMessage = useMutation(api.messages.send);
+  const [text, setText] = useState("");
+  const [error, setError] = useState("");
+
+  // Real-time rate limit status
+  const { status, check } = useRateLimit(
+    api.messages.getRateLimit,
+    {
+      getServerTimeMutation: api.messages.getServerTime,
+      count: 1,
+    }
+  );
+
+  const canSend = status.ok;
+  const waitSeconds = status.retryAt
+    ? Math.ceil((status.retryAt - Date.now()) / 1000)
+    : 0;
+
+  const handleSend = async () => {
+    if (!canSend) {
+      setError(`Please wait ${waitSeconds} seconds`);
+      return;
+    }
+
+    setError("");
+    try {
+      await sendMessage({ text, channelId });
+      setText("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to send");
+    }
+  };
+
+  return (
+    <div>
+      <input
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && handleSend()}
+        placeholder="Type a message..."
+        disabled={!canSend}
+      />
+      <button onClick={handleSend} disabled={!canSend}>
+        {canSend ? "Send" : `Wait ${waitSeconds}s`}
+      </button>
+      {error && <div className="error">{error}</div>}
+    </div>
+  );
+}
+```
+
+### Manual Error Handling
+
+```tsx src/MessageInputSimple.tsx
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+import { useState } from "react";
+
+export function MessageInputSimple({ channelId }: { channelId: string }) {
+  const sendMessage = useMutation(api.messages.send);
+  const [text, setText] = useState("");
+  const [error, setError] = useState("");
+
+  const handleSend = async () => {
+    try {
+      await sendMessage({ text, channelId });
+      setText("");
+      setError("");
+    } catch (err) {
+      // Extract wait time from error message
+      const message = err instanceof Error ? err.message : "Failed";
+      setError(message);
+      
+      // Auto-clear error after wait time
+      if (message.includes("wait")) {
+        const match = message.match(/(\d+) seconds/);
+        if (match) {
+          setTimeout(() => setError(""), parseInt(match[1]) * 1000);
+        }
+      }
+    }
+  };
+
+  return (
+    <div>
+      <input
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && handleSend()}
+        placeholder="Type a message..."
+      />
+      <button onClick={handleSend}>Send</button>
+      {error && <div className="error">{error}</div>}
+    </div>
+  );
+}
+```
+
+## Testing the Rate Limit
+
+```ts convex/test.ts
+import { internalMutation } from "./_generated/server";
+import { rateLimiter } from "./rateLimits";
+
+export const testMessageLimit = internalMutation({
+  handler: async (ctx) => {
+    const testUserId = "user123";
+
+    // Should be able to send 3 messages immediately (capacity)
+    for (let i = 0; i < 3; i++) {
+      const result = await rateLimiter.limit(ctx, "sendMessage", {
+        key: testUserId,
+      });
+      if (!result.ok) {
+        throw new Error(`Message ${i + 1} should have succeeded`);
+      }
+    }
+
+    // 4th message should be rate limited
+    const fourth = await rateLimiter.limit(ctx, "sendMessage", {
+      key: testUserId,
+    });
+    if (fourth.ok) {
+      throw new Error("4th message should be rate limited");
+    }
+
+    console.log(`✓ Rate limit working! Retry after ${fourth.retryAfter}ms`);
+
+    // Different user should have their own limit
+    const otherUser = await rateLimiter.limit(ctx, "sendMessage", {
+      key: "user456",
+    });
+    if (!otherUser.ok) {
+      throw new Error("Other user should not be rate limited");
+    }
+
+    console.log("✓ Per-user isolation working!");
+  },
+});
+```
+
+## Common Variations
+
+<Tabs>
+  <Tab title="Stricter Limits">
+    ```ts
+    // Only 5 messages per minute, no bursts
+    sendMessage: {
+      kind: "token bucket",
+      rate: 5,
+      period: MINUTE,
+      capacity: 1, // No burst capacity
+    }
+    ```
+  </Tab>
+  <Tab title="More Generous Bursts">
+    ```ts
+    // Allow bursts of 10 messages
+    sendMessage: {
+      kind: "token bucket",
+      rate: 10,
+      period: MINUTE,
+      capacity: 10,
+    }
+    ```
+  </Tab>
+  <Tab title="Different Limits by User Type">
+    ```ts
+    const isPremium = await checkUserSubscription(ctx, userId);
+    const limitName = isPremium ? "sendMessagePremium" : "sendMessage";
+    
+    const result = await rateLimiter.limit(ctx, limitName, {
+      key: userId,
+    });
+    ```
+    
+    Configure both:
+    ```ts
+    const rateLimiter = new RateLimiter(components.rateLimiter, {
+      sendMessage: { kind: "token bucket", rate: 10, period: MINUTE, capacity: 3 },
+      sendMessagePremium: { kind: "token bucket", rate: 100, period: MINUTE, capacity: 20 },
+    });
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  **Capacity vs Rate:** The `capacity` determines burst size, while `rate` controls sustained throughput. A capacity of 3 with rate of 10/minute means users can send 3 messages instantly, then must wait ~6 seconds between subsequent messages.
+</Note>
+
+<Tip>
+  Use the React hook (`useRateLimit`) to show real-time feedback in your UI. This prevents users from hitting the rate limit and seeing errors.
+</Tip>

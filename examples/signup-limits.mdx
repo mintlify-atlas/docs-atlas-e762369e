@@ -1,0 +1,206 @@
+---
+title: "Preventing Bot Signups"
+description: "Limit free trial signups with a global rate limit to deter bots and abuse"
+---
+
+## The Problem
+
+During free trial periods, bots can rapidly create accounts to abuse your service. You need to limit the total number of signups across your entire application without blocking legitimate users.
+
+## Solution: Global Fixed Window Rate Limit
+
+Use a **global rate limit** with a **fixed window** strategy to cap total signups per hour. This doesn't require user authentication since it applies to all signups collectively.
+
+## Configuration
+
+```ts convex/rateLimits.ts
+import { RateLimiter, HOUR } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Allow 100 total signups per hour across all users
+  freeTrialSignUp: { kind: "fixed window", rate: 100, period: HOUR },
+});
+
+export { rateLimiter };
+```
+
+**Why fixed window?** Tokens are granted all at once at the start of each hour, making the limit predictable. The random start time prevents all retries from happening at the exact same moment.
+
+## Implementation
+
+### Backend Mutation
+
+```ts convex/auth.ts
+import { v } from "convex/values";
+import { mutation } from "./_generated/server";
+import { rateLimiter } from "./rateLimits";
+
+export const signUp = mutation({
+  args: {
+    email: v.string(),
+    password: v.string(),
+  },
+  handler: async (ctx, args) => {
+    // Check the global rate limit first
+    const { ok, retryAfter } = await rateLimiter.limit(
+      ctx,
+      "freeTrialSignUp"
+    );
+
+    if (!ok) {
+      throw new Error(
+        `Too many signups. Please try again in ${Math.ceil(retryAfter! / 60000)} minutes.`
+      );
+    }
+
+    // Proceed with account creation
+    const userId = await ctx.db.insert("users", {
+      email: args.email,
+      passwordHash: await hashPassword(args.password),
+      createdAt: Date.now(),
+    });
+
+    return { success: true, userId };
+  },
+});
+
+function hashPassword(password: string): Promise<string> {
+  // Your password hashing logic
+  return Promise.resolve(password);
+}
+```
+
+### Client-Side Usage
+
+```tsx src/SignupForm.tsx
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+import { useState } from "react";
+
+export function SignupForm() {
+  const signUp = useMutation(api.auth.signUp);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+
+    try {
+      await signUp({ email, password });
+      // Redirect to dashboard
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Signup failed");
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input
+        type="email"
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+        placeholder="Email"
+      />
+      <input
+        type="password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        placeholder="Password"
+      />
+      <button type="submit">Sign Up</button>
+      {error && <div className="error">{error}</div>}
+    </form>
+  );
+}
+```
+
+## Testing the Rate Limit
+
+Verify the limit is working:
+
+```ts convex/test.ts
+import { internalMutation } from "./_generated/server";
+import { rateLimiter } from "./rateLimits";
+
+export const testSignupLimit = internalMutation({
+  handler: async (ctx) => {
+    // First 100 should succeed
+    for (let i = 0; i < 100; i++) {
+      const result = await rateLimiter.limit(ctx, "freeTrialSignUp");
+      if (!result.ok) {
+        throw new Error(`Failed at signup ${i}`);
+      }
+    }
+
+    // 101st should fail
+    const blocked = await rateLimiter.limit(ctx, "freeTrialSignUp");
+    if (blocked.ok) {
+      throw new Error("Rate limit should have blocked this request");
+    }
+
+    console.log(`Rate limit working! Retry after ${blocked.retryAfter}ms`);
+  },
+});
+```
+
+Run in your Convex dashboard:
+```bash
+npx convex run test:testSignupLimit
+```
+
+## Common Variations
+
+<Tabs>
+  <Tab title="Different Time Windows">
+    ```ts
+    // Daily limit
+    freeTrialSignUp: { kind: "fixed window", rate: 1000, period: DAY }
+
+    // Per-minute for stricter control
+    freeTrialSignUp: { kind: "fixed window", rate: 10, period: MINUTE }
+    ```
+  </Tab>
+  <Tab title="With Capacity for Bursts">
+    ```ts
+    // Allow bursts up to 200, refilling at 100/hour
+    freeTrialSignUp: {
+      kind: "fixed window",
+      rate: 100,
+      period: HOUR,
+      capacity: 200
+    }
+    ```
+  </Tab>
+  <Tab title="Graceful Degradation">
+    ```ts
+    const { ok, retryAfter } = await rateLimiter.limit(
+      ctx,
+      "freeTrialSignUp"
+    );
+
+    if (!ok) {
+      // Instead of blocking, queue the signup for later
+      await ctx.scheduler.runAfter(
+        retryAfter!,
+        internal.auth.processSignup,
+        { email, password }
+      );
+      return { queued: true, waitTime: retryAfter };
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  **Best Practice:** Monitor your signup rate limit metrics. If legitimate users are frequently hitting the limit, increase the `rate` or use a per-IP rate limit instead.
+</Note>
+
+<Warning>
+  Global rate limits affect all users. Consider combining with:
+  - Per-IP rate limits for finer control
+  - CAPTCHA after multiple failed attempts
+  - Email verification before activation
+</Warning>

@@ -1,97 +1,212 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Convex Rate Limiter"
+description: "Type-safe, transactional application-layer rate limiting for Convex with configurable sharding to scale"
+mode: "custom"
 ---
 
-## Setting up
+<div className="relative bg-gradient-to-br from-[#020627] via-[#0a0d2e] to-[#020627] dark:bg-gradient-to-br dark:from-[#020627] dark:via-[#0a0d2e] dark:to-[#020627] bg-white py-20 overflow-hidden">
+  <div className="absolute inset-0 bg-grid-white/[0.02] bg-[size:50px_50px]" />
+  <div className="relative max-w-6xl mx-auto px-6">
+    <div className="flex flex-col lg:flex-row items-center gap-12">
+      <div className="flex-1 space-y-6">
+        <h1 className="text-5xl sm:text-6xl lg:text-7xl font-bold text-white dark:text-white">
+          Application-Layer Rate Limiting
+        </h1>
+        <p className="text-xl text-gray-300 dark:text-gray-300 max-w-2xl">
+          Define and enforce type-safe rate limits in your Convex backend. Transactional, fair, and scalable with configurable sharding.
+        </p>
+        <div className="flex flex-wrap gap-4 pt-4">
+          <a 
+            href="/quickstart" 
+            className="inline-flex items-center px-6 py-3 rounded-lg bg-[#238636] hover:bg-[#2ea043] text-white font-semibold transition-colors no-underline"
+          >
+            Get Started
+            <svg className="ml-2 w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
+            </svg>
+          </a>
+          <a 
+            href="/api/rate-limiter" 
+            className="inline-flex items-center px-6 py-3 rounded-lg border border-white/30 bg-white/10 hover:bg-white/20 text-white font-semibold transition-colors no-underline"
+          >
+            API Reference
+          </a>
+        </div>
+      </div>
+      <div className="flex-1 lg:flex justify-center hidden">
+        <div className="relative">
+          <div className="absolute inset-0 bg-gradient-to-r from-[#529c3a]/20 to-[#238636]/20 blur-3xl" />
+          <div className="relative bg-[rgba(48,54,79,1)] dark:bg-[rgba(48,54,79,1)] border border-[rgba(96,99,146,1)] dark:border-[rgba(96,99,146,1)] rounded-2xl p-6 shadow-2xl">
+            <pre className="text-sm text-gray-100 dark:text-gray-100 overflow-x-auto"><code>{`const rateLimiter = new RateLimiter(
+  components.rateLimiter,
+  {
+    sendMessage: {
+      kind: "token bucket",
+      rate: 10,
+      period: MINUTE,
+      capacity: 3
+    }
+  }
+);
 
-Get your documentation site up and running in minutes.
+const status = await rateLimiter.limit(
+  ctx,
+  "sendMessage",
+  { key: userId }
+);`}</code></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="text-center mb-12">
+    <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Quick Start</h2>
+    <p className="text-lg text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
+      Get up and running with rate limiting in minutes
+    </p>
+  </div>
 
-## Make it yours
+  <Steps>
+    <Step title="Install the package">
+      Add the rate limiter component to your Convex project:
+      
+      ```bash
+      npm install @convex-dev/rate-limiter
+      ```
+    </Step>
+    
+    <Step title="Configure the component">
+      Create or update your `convex/convex.config.ts` file:
+      
+      ```typescript
+      import { defineApp } from "convex/server";
+      import rateLimiter from "@convex-dev/rate-limiter/convex.config.js";
 
-Design a docs site that looks great and empowers your users.
+      const app = defineApp();
+      app.use(rateLimiter);
 
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
-  </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
-  </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
-  </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
-  </Card>
-</Columns>
+      export default app;
+      ```
+    </Step>
+    
+    <Step title="Define your rate limits">
+      Create a rate limiter instance with your configuration:
+      
+      ```typescript
+      import { RateLimiter, MINUTE, HOUR } from "@convex-dev/rate-limiter";
+      import { components } from "./_generated/api";
 
-## Create beautiful pages
+      const rateLimiter = new RateLimiter(components.rateLimiter, {
+        sendMessage: { kind: "token bucket", rate: 10, period: MINUTE, capacity: 3 },
+        freeTrialSignUp: { kind: "fixed window", rate: 100, period: HOUR }
+      });
+      ```
+    </Step>
+    
+    <Step title="Use in your mutations">
+      Enforce rate limits in your Convex mutations:
+      
+      ```typescript
+      export const sendMessage = mutation({
+        args: { message: v.string() },
+        handler: async (ctx, args) => {
+          const userId = await getUserId(ctx);
+          
+          // Check rate limit
+          const { ok, retryAfter } = await rateLimiter.limit(ctx, "sendMessage", {
+            key: userId
+          });
+          
+          if (!ok) {
+            throw new Error(`Rate limited. Retry after ${retryAfter}ms`);
+          }
+          
+          // Process the message
+          await ctx.db.insert("messages", { userId, text: args.message });
+        }
+      });
+      ```
+    </Step>
+  </Steps>
+</div>
 
-Everything you need to create world-class documentation.
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="text-center mb-12">
+    <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Key Features</h2>
+    <p className="text-lg text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
+      Everything you need for production-grade rate limiting
+    </p>
+  </div>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+  <CardGroup cols={2}>
+    <Card title="Type-Safe" icon="shield-check" href="/concepts/rate-limiting">
+      Define rate limits with full TypeScript support. Catch configuration errors at compile time, not runtime.
+    </Card>
+    <Card title="Transactional" icon="rotate" href="/concepts/strategies">
+      Rate limit changes roll back automatically if your mutation fails. No partial state or leaked capacity.
+    </Card>
+    <Card title="Scalable Sharding" icon="layer-group" href="/advanced/sharding">
+      Configure sharding to handle high throughput without compromising correctness or fairness.
+    </Card>
+    <Card title="Fair Reservations" icon="clock" href="/advanced/reservations">
+      Reserve capacity ahead of time to prevent starvation and avoid exponential backoff.
+    </Card>
+    <Card title="Multiple Algorithms" icon="chart-line" href="/concepts/strategies">
+      Choose between token bucket for smooth rate limiting or fixed window for burst allowance.
+    </Card>
+    <Card title="React Integration" icon="react" href="/advanced/react-hooks">
+      Built-in React hooks for client-side rate limit status and synchronized timing.
+    </Card>
+  </CardGroup>
+</div>
 
-## Need inspiration?
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="text-center mb-12">
+    <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Common Use Cases</h2>
+    <p className="text-lg text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
+      Explore real-world examples and patterns
+    </p>
+  </div>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+  <CardGroup cols={2}>
+    <Card title="User Actions" icon="user" href="/examples/messaging-limits">
+      Limit how fast users can perform actions like sending messages or posting content.
+    </Card>
+    <Card title="API Protection" icon="server" href="/usage/basic-usage">
+      Protect your backend from abuse with global or per-user rate limits.
+    </Card>
+    <Card title="Free Trial Signup" icon="user-plus" href="/examples/signup-limits">
+      Prevent bot signups by limiting registration rates during free trials.
+    </Card>
+    <Card title="Failed Login Attempts" icon="lock" href="/examples/failed-logins">
+      Implement security best practices by rate limiting authentication failures.
+    </Card>
+    <Card title="LLM API Calls" icon="brain" href="/examples/llm-rate-limits">
+      Control costs by limiting AI API requests with token bucket rate limits.
+    </Card>
+    <Card title="Custom Workflows" icon="diagram-project" href="/usage/custom-counts">
+      Build sophisticated rate limiting for complex business logic.
+    </Card>
+  </CardGroup>
+</div>
+
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="bg-gradient-to-r from-[#238636] to-[#529c3a] dark:from-[#238636] dark:to-[#529c3a] rounded-2xl p-8 text-center">
+    <h2 className="text-3xl font-bold text-white mb-4">Ready to Get Started?</h2>
+    <p className="text-xl text-white/90 mb-6 max-w-2xl mx-auto">
+      Add production-grade rate limiting to your Convex backend in minutes
+    </p>
+    <a 
+      href="/quickstart" 
+      className="inline-flex items-center px-8 py-4 rounded-lg bg-white hover:bg-gray-100 text-[#238636] font-bold text-lg transition-colors no-underline"
+    >
+      View Quickstart Guide
+      <svg className="ml-2 w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
+      </svg>
+    </a>
+  </div>
+</div>

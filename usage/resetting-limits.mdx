@@ -1,0 +1,402 @@
+---
+title: Resetting Limits
+description: Clear rate limit state using the reset() method
+---
+
+## Overview
+
+The `reset()` method removes a rate limit's state from the database, allowing the next request to start fresh with full capacity.
+
+## Using the reset() Method
+
+```ts
+await rateLimiter.reset(ctx, "failedLogins", { key: userId });
+```
+
+From `src/client/index.ts:147-166`:
+
+```ts
+/**
+ * Reset a rate limit. This will remove the rate limit from the database.
+ * The next request will start fresh.
+ * Note: In the case of a fixed window without a specified `start`,
+ * the new window will be a random time.
+ * @param ctx The ctx object from a mutation, including runMutation.
+ * @param name The name of the rate limit to reset, including all shards.
+ * @param key If a key is provided, it will reset the rate limit for that key.
+ * If not, it will reset the rate limit for the shared value.
+ */
+async reset<Name extends string = keyof Limits & string>(
+  { runMutation }: RunMutationCtx,
+  name: Name,
+  args?: { key?: string },
+): Promise<void> {
+  await runMutation(this.component.lib.resetRateLimit, {
+    ...(args ?? null),
+    name,
+  });
+}
+```
+
+## When to Reset Rate Limits
+
+### 1. Successful Login After Failed Attempts
+
+The most common use case is resetting failed login attempts after a successful login:
+
+```ts
+import { RateLimiter, HOUR } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+import { mutation } from "./_generated/server";
+
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  failedLogins: { kind: "token bucket", rate: 10, period: HOUR },
+});
+
+export const login = mutation({
+  args: { email: v.string(), password: v.string() },
+  handler: async (ctx, args) => {
+    // Check if too many failed attempts
+    const status = await rateLimiter.limit(ctx, "failedLogins", { 
+      key: args.email 
+    });
+    
+    if (!status.ok) {
+      throw new Error(`Too many failed login attempts. Try again in ${Math.ceil(status.retryAfter! / 1000)} seconds.`);
+    }
+    
+    // Verify credentials
+    const user = await verifyPassword(ctx, args.email, args.password);
+    
+    if (!user) {
+      // Failed login - token was already consumed by limit()
+      throw new Error("Invalid credentials");
+    }
+    
+    // Successful login - reset the failed attempts counter
+    await rateLimiter.reset(ctx, "failedLogins", { key: args.email });
+    
+    return { userId: user._id };
+  },
+});
+```
+
+From the README:
+> "Reset a rate limit on successful login"
+
+### 2. Admin Override
+
+Allow admins to manually reset rate limits for specific users:
+
+```ts
+export const adminResetUserLimit = mutation({
+  args: { 
+    userId: v.string(),
+    limitName: v.string(),
+  },
+  handler: async (ctx, args) => {
+    // Verify admin privileges
+    const isAdmin = await checkIsAdmin(ctx);
+    if (!isAdmin) {
+      throw new Error("Unauthorized");
+    }
+    
+    // Reset the user's rate limit
+    await rateLimiter.reset(ctx, args.limitName, { key: args.userId });
+    
+    console.log(`Admin reset ${args.limitName} for user ${args.userId}`);
+  },
+});
+```
+
+### 3. Account Upgrades
+
+Reset limits when a user upgrades their account:
+
+```ts
+export const upgradeAccount = mutation({
+  args: { userId: v.string() },
+  handler: async (ctx, args) => {
+    // Upgrade the account
+    await ctx.db.patch(args.userId, { plan: "premium" });
+    
+    // Reset their rate limits to give them a fresh start
+    await rateLimiter.reset(ctx, "apiCalls", { key: args.userId });
+    await rateLimiter.reset(ctx, "exports", { key: args.userId });
+    
+    return { success: true };
+  },
+});
+```
+
+### 4. Testing and Development
+
+Reset limits in test code to ensure clean state:
+
+```ts
+export const testRateLimit = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const testKey = "test-user";
+    
+    // Reset before test
+    await rateLimiter.reset(ctx, "sendMessage", { key: testKey });
+    
+    // Now test with fresh state
+    const first = await rateLimiter.limit(ctx, "sendMessage", { key: testKey });
+    assert(first.ok);
+    
+    // ... more tests
+  },
+});
+```
+
+## Real Example from Source Code
+
+From `example/convex/example.ts:106-129`:
+
+```ts
+export const inlineConfig = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    for (const kind of ["token bucket", "fixed window"] as const) {
+      const rateLimiter = new RateLimiter(components.rateLimiter);
+
+      const config = {
+        kind,
+        rate: 1,
+        period: SECOND,
+      } as RateLimitConfig;
+      
+      const before = await rateLimiter.limit(ctx, "simple " + kind, { config });
+      assert(before.ok);
+      assert(before.retryAfter === undefined);
+      
+      const after = await rateLimiter.check(ctx, "simple " + kind, { config });
+      assert(!after.ok);
+      assert(after.retryAfter! > 0);
+      
+      // Reset and verify it's cleared
+      await rateLimiter.reset(ctx, "simple " + kind);
+      
+      const after2 = await rateLimiter.check(ctx, "simple " + kind, { config });
+      assert(after2.ok);
+      assert(after2.retryAfter === undefined);
+    }
+  },
+});
+```
+
+## Resetting Specific Keys vs Global
+
+<Tabs>
+  <Tab title="Reset Specific Key">
+    Reset the rate limit for a specific user/key:
+    
+    ```ts
+    // Reset just this user's limit
+    await rateLimiter.reset(ctx, "sendMessage", { key: userId });
+    ```
+    
+    This only affects the specified key. Other users' rate limits are unaffected.
+  </Tab>
+  
+  <Tab title="Reset Global Limit">
+    Reset a global (singleton) rate limit:
+    
+    ```ts
+    // Reset the global limit (no key)
+    await rateLimiter.reset(ctx, "freeTrialSignUp");
+    ```
+    
+    This resets the shared rate limit that applies to all requests.
+  </Tab>
+</Tabs>
+
+## Sharding Behavior
+
+From the documentation:
+> "Reset a rate limit to reset, including all shards."
+
+When you reset a rate limit that uses sharding, **all shards are reset**:
+
+```ts
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  llmTokens: { kind: "token bucket", rate: 40000, period: MINUTE, shards: 10 },
+});
+
+// This resets ALL 10 shards
+await rateLimiter.reset(ctx, "llmTokens", { key: userId });
+```
+
+## Fixed Window Behavior
+
+From the documentation:
+> "Note: In the case of a fixed window without a specified `start`, the new window will be a random time."
+
+When you reset a fixed window rate limit:
+- If the config specifies a `start` time, the window aligns to that
+- If no `start` is specified, a new random start time is chosen
+
+This helps prevent thundering herd issues:
+
+```ts
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // No start time - will get random window on reset
+  hourlyLimit: { kind: "fixed window", rate: 100, period: HOUR },
+});
+
+await rateLimiter.reset(ctx, "hourlyLimit", { key: userId });
+// The new window starts at a random time, not necessarily now
+```
+
+## What Happens After Reset
+
+After calling `reset()`, the rate limit behaves as if it was never used:
+
+```ts
+// Use up all capacity
+for (let i = 0; i < 3; i++) {
+  await rateLimiter.limit(ctx, "sendMessage", { key: userId });
+}
+
+// Now at capacity
+const status1 = await rateLimiter.check(ctx, "sendMessage", { key: userId });
+// status1.ok === false
+
+// Reset
+await rateLimiter.reset(ctx, "sendMessage", { key: userId });
+
+// Full capacity restored
+const status2 = await rateLimiter.check(ctx, "sendMessage", { key: userId });
+// status2.ok === true
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Only reset after successful operations">
+    For security-sensitive operations like login attempts, only reset after confirming success:
+    
+    ```ts
+    // ❌ Don't reset before verification
+    await rateLimiter.reset(ctx, "failedLogins", { key: email });
+    const user = await verifyPassword(ctx, email, password);
+    
+    // ✅ Reset after successful verification
+    const user = await verifyPassword(ctx, email, password);
+    if (user) {
+      await rateLimiter.reset(ctx, "failedLogins", { key: email });
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Log reset operations">
+    Keep an audit trail of when limits are reset:
+    
+    ```ts
+    await rateLimiter.reset(ctx, "apiCalls", { key: userId });
+    
+    await ctx.db.insert("auditLog", {
+      action: "rate_limit_reset",
+      limitName: "apiCalls",
+      userId,
+      timestamp: Date.now(),
+    });
+    ```
+  </Accordion>
+  
+  <Accordion title="Use with caution for abuse prevention">
+    Be careful about providing reset functionality to users for security-critical limits:
+    
+    ```ts
+    // ❌ Risky: users could reset their own failed login limits
+    export const resetMyFailedLogins = mutation({
+      handler: async (ctx) => {
+        const userId = await getUserId(ctx);
+        await rateLimiter.reset(ctx, "failedLogins", { key: userId });
+      },
+    });
+    
+    // ✅ Better: only reset on successful login
+    // (as shown in the login example above)
+    ```
+  </Accordion>
+  
+  <Accordion title="Consider partial resets for UX">
+    Instead of full reset, you might want to just add capacity:
+    
+    ```ts
+    // Instead of full reset, which might be too generous:
+    // await rateLimiter.reset(ctx, "uploads", { key: userId });
+    
+    // Consider using a separate "bonus" limit:
+    await rateLimiter.limit(ctx, "uploadsBonus", { 
+      key: userId,
+      count: -10,  // Add 10 tokens back
+    });
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Common Patterns
+
+### Password Reset Flow
+
+```ts
+export const requestPasswordReset = mutation({
+  args: { email: v.string() },
+  handler: async (ctx, args) => {
+    // Rate limit password reset requests
+    await rateLimiter.limit(ctx, "passwordResetRequests", {
+      key: args.email,
+      throws: true,
+    });
+    
+    // Send reset email
+    await sendPasswordResetEmail(args.email);
+  },
+});
+
+export const completePasswordReset = mutation({
+  args: { token: v.string(), newPassword: v.string() },
+  handler: async (ctx, args) => {
+    const email = await verifyResetToken(args.token);
+    
+    // Update password
+    await updatePassword(ctx, email, args.newPassword);
+    
+    // Reset both failed logins and password reset requests
+    await rateLimiter.reset(ctx, "failedLogins", { key: email });
+    await rateLimiter.reset(ctx, "passwordResetRequests", { key: email });
+  },
+});
+```
+
+### Free Trial to Paid Conversion
+
+```ts
+export const convertToPaid = mutation({
+  args: { userId: v.string() },
+  handler: async (ctx, args) => {
+    // Update subscription
+    await ctx.db.patch(args.userId, { 
+      plan: "paid",
+      convertedAt: Date.now(),
+    });
+    
+    // Give them a fresh start on all limits
+    await rateLimiter.reset(ctx, "apiCalls", { key: args.userId });
+    await rateLimiter.reset(ctx, "exports", { key: args.userId });
+    await rateLimiter.reset(ctx, "uploads", { key: args.userId });
+    
+    return { success: true, message: "Welcome to the paid plan!" };
+  },
+});
+```
+
+## Next Steps
+
+- Learn about [Error Handling](/usage/error-handling) with rate limits
+- Understand [Checking Limits](/usage/checking-limits) without consuming
+- Explore [Basic Usage](/usage/basic-usage) for getting started

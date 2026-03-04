@@ -1,0 +1,108 @@
+---
+title: RateLimiter
+description: Core class for managing rate limits in Convex applications
+---
+
+## Overview
+
+The `RateLimiter` class is the main interface for defining and managing rate limits in your Convex application. It provides a type-safe way to configure multiple named rate limits and enforce them across your queries and mutations.
+
+## Constructor
+
+```typescript
+new RateLimiter<Limits extends Record<string, RateLimitConfig>>(
+  component: ComponentApi,
+  limits?: Limits
+)
+```
+
+### Type Parameters
+
+<ParamField path="Limits" type="Record<string, RateLimitConfig>" default="Record<never, never>">
+  A record mapping rate limit names to their configurations. This type parameter enables type-safe access to named rate limits.
+</ParamField>
+
+### Parameters
+
+<ParamField path="component" type="ComponentApi" required>
+  The rate limiter component from your Convex generated API. Import this as `components.rateLimiter` from `./_generated/api.js`.
+</ParamField>
+
+<ParamField path="limits" type="Limits">
+  An object defining your rate limits. Each key is a rate limit name, and each value is a `RateLimitConfig` object. If you don't define limits here, you must provide the `config` inline when calling rate limit methods.
+</ParamField>
+
+## Usage Example
+
+```typescript
+import { RateLimiter, MINUTE, HOUR } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api.js";
+
+// Define multiple named rate limits
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  // Per-user limit: 10 messages per minute, burst of 3
+  sendMessage: {
+    kind: "token bucket",
+    rate: 10,
+    period: MINUTE,
+    capacity: 3,
+  },
+  // Global limit: 100 signups per hour
+  freeTrialSignUp: {
+    kind: "fixed window",
+    rate: 100,
+    period: HOUR,
+  },
+});
+
+// Use in a mutation
+export const sendMessage = mutation({
+  args: { text: v.string() },
+  handler: async (ctx, args) => {
+    await rateLimiter.limit(ctx, "sendMessage", {
+      key: ctx.userId,
+      throws: true,
+    });
+    // ... send message logic
+  },
+});
+```
+
+## Available Methods
+
+The `RateLimiter` class provides the following methods:
+
+- [`limit()`](/api/limit) - Check and consume rate limit tokens (mutations only)
+- [`check()`](/api/check) - Check rate limit without consuming tokens (queries and mutations)
+- [`reset()`](/api/reset) - Reset a rate limit to its initial state
+- [`getValue()`](/api/get-value) - Get current rate limit state and metadata
+- `hookAPI()` - Create client-accessible queries for rate limit status
+
+## Type Safety
+
+When you define rate limits in the constructor, TypeScript will:
+
+- Auto-complete rate limit names when calling methods
+- Enforce that named rate limits exist
+- Allow optional `config` parameter for predefined limits
+- Require `config` parameter for inline (unnamed) rate limits
+
+```typescript
+// TypeScript knows "sendMessage" exists
+await rateLimiter.limit(ctx, "sendMessage", { key: userId });
+
+// TypeScript error: "invalidName" is not defined
+await rateLimiter.limit(ctx, "invalidName", { key: userId });
+
+// Inline config required for undefined names
+await rateLimiter.limit(ctx, "customLimit", {
+  key: userId,
+  config: { kind: "token bucket", rate: 5, period: MINUTE },
+});
+```
+
+## Related
+
+- [RateLimitConfig](/api/types) - Rate limit configuration types
+- [limit()](/api/limit) - Rate limiting method
+- [check()](/api/check) - Non-consuming check method

@@ -1,0 +1,326 @@
+---
+title: "hookAPI"
+description: "Create server-side API for React hook integration"
+---
+
+## Overview
+
+The `hookAPI()` method creates a public query and mutation that can be used with the `useRateLimit` React hook. It returns two functions: `getRateLimit` for fetching current rate limit values, and `getServerTime` for client/server time synchronization.
+
+## Method Signature
+
+```typescript
+class RateLimiter<Limits> {
+  hookAPI<DataModel extends GenericDataModel, Name extends string>(
+    name: Name,
+    options?: HookOptions<DataModel>
+  ): {
+    getRateLimit: QueryFunction;
+    getServerTime: MutationFunction;
+  }
+}
+```
+
+### Type Definitions
+
+```typescript
+type HookOptions<DataModel> = {
+  key?: string | ((ctx: GenericQueryCtx<DataModel>, keyFromClient?: string) => string | Promise<string>);
+  sampleShards?: number;
+};
+```
+
+## Parameters
+
+<ParamField path="name" type="string" required>
+  The name of the rate limit to expose. Must match a rate limit defined in your `RateLimiter` constructor, unless you provide an inline `config`.
+</ParamField>
+
+<ParamField path="options" type="HookOptions">
+  Optional configuration for the hook API.
+
+  <Expandable title="properties">
+    <ParamField path="key" type="string | function">
+      Determines how the rate limit key is resolved. Three patterns:
+
+      **Static key** (string):
+      ```ts
+      key: "global"
+      ```
+      All clients share the same rate limit.
+
+      **Server-side function**:
+      ```ts
+      key: async (ctx) => await getUserId(ctx)
+      ```
+      The server determines the key based on authentication context. **Most secure option**.
+
+      **Client-provided key** (function with keyFromClient parameter):
+      ```ts
+      key: async (ctx, keyFromClient) => {
+        await ensureUserCanUseKey(ctx, keyFromClient);
+        return keyFromClient;
+      }
+      ```
+      Allows clients to specify the key, but validates it server-side. **Use with caution** - see security warning below.
+    </ParamField>
+
+    <ParamField path="sampleShards" type="number">
+      Number of shards to sample when checking the rate limit. Higher values provide more accurate results for sharded rate limits but increase query cost.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Return Value
+
+<ResponseField name="getRateLimit" type="QueryFunction">
+  A Convex public query that returns the current rate limit value and metadata.
+
+  **Arguments**:
+  ```typescript
+  {
+    name?: string;        // Override the rate limit name
+    key?: string;         // Client-provided key (only if allowed)
+    sampleShards?: number; // Override sampleShards
+    config?: RateLimitConfig; // Inline config
+  }
+  ```
+
+  **Returns**:
+  ```typescript
+  {
+    value: number;        // Current token value
+    ts: number;          // Server timestamp
+    shard: number;       // Shard number used
+    config: RateLimitConfig; // Rate limit configuration
+  }
+  ```
+</ResponseField>
+
+<ResponseField name="getServerTime" type="MutationFunction">
+  A Convex public mutation that returns the current server time (`Date.now()`). Used by `useRateLimit` to synchronize client and server clocks.
+
+  **Arguments**: None
+
+  **Returns**: `number` - Server timestamp in milliseconds
+</ResponseField>
+
+## Usage Patterns
+
+### Pattern 1: Server-Side Key (Recommended)
+
+```ts
+// convex/messages.ts
+import { rateLimiter } from "./rateLimiter";
+import { getUserId } from "./auth";
+
+export const { getRateLimit, getServerTime } = rateLimiter.hookAPI(
+  "sendMessage",
+  {
+    // Server determines the key based on authenticated user
+    key: async (ctx) => {
+      const userId = await getUserId(ctx);
+      if (!userId) throw new Error("Not authenticated");
+      return userId;
+    },
+  }
+);
+```
+
+```tsx
+// React component
+import { useRateLimit } from "@convex-dev/rate-limiter/react";
+import { api } from "./convex/_generated/api";
+
+function MyComponent() {
+  const { status } = useRateLimit(api.messages.getRateLimit, {
+    getServerTimeMutation: api.messages.getServerTime,
+  });
+  
+  // ...
+}
+```
+
+### Pattern 2: Static Key (Global Rate Limit)
+
+```ts
+// convex/freeTrials.ts
+export const { getRateLimit, getServerTime } = rateLimiter.hookAPI(
+  "freeTrialSignUp",
+  {
+    // All clients share this rate limit
+    key: "global",
+  }
+);
+```
+
+### Pattern 3: Client-Provided Key (Use with Caution)
+
+```ts
+// convex/multiTenant.ts
+export const { getRateLimit, getServerTime } = rateLimiter.hookAPI(
+  "organizationAPI",
+  {
+    key: async (ctx, keyFromClient) => {
+      // IMPORTANT: Validate the client can access this key
+      const userId = await getUserId(ctx);
+      const userOrgs = await ctx.db
+        .query("memberships")
+        .withIndex("by_user", (q) => q.eq("userId", userId))
+        .collect();
+      
+      if (!userOrgs.some(m => m.orgId === keyFromClient)) {
+        throw new Error("Access denied to this organization");
+      }
+      
+      return keyFromClient;
+    },
+  }
+);
+```
+
+```tsx
+// React component
+function OrganizationDashboard({ orgId }) {
+  const { status } = useRateLimit(api.multiTenant.getRateLimit, {
+    key: orgId,  // Client provides the org ID
+    getServerTimeMutation: api.multiTenant.getServerTime,
+  });
+  
+  // ...
+}
+```
+
+<Warning>
+  **Security Consideration**: When using client-provided keys, **always validate** that the authenticated user has permission to access that key's rate limit. Without validation, malicious clients could check rate limits for other users or organizations.
+</Warning>
+
+## Complete Setup Example
+
+### Server Setup
+
+```ts
+// convex/rateLimiter.ts
+import { RateLimiter, MINUTE } from "@convex-dev/rate-limiter";
+import { components } from "./_generated/api";
+
+export const rateLimiter = new RateLimiter(components.rateLimiter, {
+  sendMessage: { kind: "token bucket", rate: 10, period: MINUTE, capacity: 3 },
+});
+```
+
+```ts
+// convex/messages.ts
+import { rateLimiter } from "./rateLimiter";
+import { mutation } from "./_generated/server";
+import { getUserId } from "./auth";
+
+// Export the hook API functions
+export const { getRateLimit, getServerTime } = rateLimiter.hookAPI(
+  "sendMessage",
+  {
+    key: async (ctx) => await getUserId(ctx),
+  }
+);
+
+// Your mutation that enforces the rate limit
+export const send = mutation({
+  args: { /* ... */ },
+  handler: async (ctx, args) => {
+    const userId = await getUserId(ctx);
+    
+    // Enforce rate limit
+    await rateLimiter.limit(ctx, "sendMessage", {
+      key: userId,
+      throws: true,
+    });
+    
+    // Send the message
+    // ...
+  },
+});
+```
+
+### Client Setup
+
+```tsx
+// App.tsx
+import { useRateLimit } from "@convex-dev/rate-limiter/react";
+import { useMutation } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function SendMessageForm() {
+  const sendMessage = useMutation(api.messages.send);
+  const { status } = useRateLimit(api.messages.getRateLimit, {
+    getServerTimeMutation: api.messages.getServerTime,
+    count: 1,
+  });
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    
+    if (!status?.ok) {
+      alert("Rate limit exceeded. Please wait.");
+      return;
+    }
+    
+    try {
+      await sendMessage({ /* ... */ });
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        alert(`Rate limited. Retry in ${error.data.retryAfter}ms`);
+      }
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <button type="submit" disabled={!status?.ok}>
+        {status?.ok ? "Send" : "Rate limited"}
+      </button>
+    </form>
+  );
+}
+```
+
+## Key Function Patterns
+
+### Authentication-Based
+
+```ts
+key: async (ctx) => {
+  const identity = await ctx.auth.getUserIdentity();
+  if (!identity) throw new Error("Not authenticated");
+  return identity.subject;
+}
+```
+
+### IP-Based (requires custom auth setup)
+
+```ts
+key: async (ctx) => {
+  // Assumes you've set up IP address in auth context
+  return ctx.auth.getClientIP();
+}
+```
+
+### Multi-Tenant with Validation
+
+```ts
+key: async (ctx, keyFromClient) => {
+  if (!keyFromClient) {
+    // Default to user's personal workspace
+    return await getUserId(ctx);
+  }
+  
+  // Validate access to requested workspace
+  await ensureUserCanAccessWorkspace(ctx, keyFromClient);
+  return keyFromClient;
+}
+```
+
+## Related
+
+- [useRateLimit](/api/use-rate-limit) - React hook that uses this API
+- [React Hooks Guide](/advanced/react-hooks) - Complete integration examples
+- [getValue()](/api/get-value) - Alternative server-side value fetching
