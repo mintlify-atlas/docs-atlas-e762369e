@@ -416,3 +416,65 @@ const fixedWindowValidator = v.object({
 ```
 
 Convex validator for fixed window configurations. Use with `Infer<typeof fixedWindowValidator>` to get the TypeScript type.
+
+---
+
+## Context Types
+
+Context types used by the RateLimiter methods to specify which Convex operations are available.
+
+### RunQueryCtx
+
+A context that provides access to `runQuery`. Used by non-mutating operations like [`check()`](/api/check) and [`getValue()`](/api/get-value).
+
+```typescript
+type RunQueryCtx = {
+  runQuery: <Query extends FunctionReference<"query", "internal">>(
+    query: Query,
+    args: FunctionArgs<Query>,
+  ) => Promise<FunctionReturnType<Query>>;
+};
+```
+
+**Example:**
+
+```typescript
+// Any Convex query or mutation context works
+export const checkLimit = query({
+  handler: async (ctx, args) => {
+    // ctx implements RunQueryCtx
+    const status = await rateLimiter.check(ctx, "myLimit");
+    return status;
+  }
+});
+```
+
+### RunMutationCtx
+
+A context that extends `RunQueryCtx` and provides access to both `runQuery` and `runMutation`. Used by mutating operations like [`limit()`](/api/limit) and [`reset()`](/api/reset).
+
+```typescript
+type RunMutationCtx = RunQueryCtx & {
+  runMutation: <Mutation extends FunctionReference<"mutation", "internal">>(
+    mutation: Mutation,
+    args: FunctionArgs<Mutation>,
+  ) => Promise<FunctionReturnType<Mutation>>;
+};
+```
+
+**Example:**
+
+```typescript
+// Any Convex mutation context works
+export const sendMessage = mutation({
+  handler: async (ctx, args) => {
+    // ctx implements RunMutationCtx
+    await rateLimiter.limit(ctx, "sendMessage", { key: userId });
+    // ... rest of logic
+  }
+});
+```
+
+<Note>
+These types are satisfied by the standard Convex `QueryCtx` and `MutationCtx` types, so you typically don't need to reference them directly. They're used internally to ensure type safety.
+</Note>
