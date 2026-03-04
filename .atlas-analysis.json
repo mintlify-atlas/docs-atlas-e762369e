@@ -1,0 +1,125 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Convex Rate Limiter",
+  "projectDescription": "Type-safe, transactional application-layer rate limiting for Convex with configurable sharding to scale.",
+  "theme": "palm",
+  "primaryColor": "#848c8e",
+  "lightColor": "#11161e",
+  "darkColor": "#cfd0d2",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/rate-limiting",
+              "concepts/strategies",
+              "concepts/token-bucket",
+              "concepts/fixed-window"
+            ]
+          },
+          {
+            "group": "Usage Guide",
+            "pages": [
+              "usage/basic-usage",
+              "usage/per-user-limits",
+              "usage/custom-counts",
+              "usage/error-handling",
+              "usage/checking-limits",
+              "usage/resetting-limits"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/sharding",
+              "advanced/reservations",
+              "advanced/jitter",
+              "advanced/react-hooks",
+              "advanced/dynamic-limits"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/signup-limits",
+              "examples/messaging-limits",
+              "examples/failed-logins",
+              "examples/llm-rate-limits"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/rate-limiter",
+              "api/limit",
+              "api/check",
+              "api/reset",
+              "api/get-value"
+            ]
+          },
+          {
+            "group": "React",
+            "pages": [
+              "api/use-rate-limit",
+              "api/hook-api"
+            ]
+          },
+          {
+            "group": "Types & Constants",
+            "pages": [
+              "api/types",
+              "api/constants",
+              "api/utilities"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Type-safe rate limit definitions",
+    "Token bucket and fixed window algorithms",
+    "Transactional evaluation with automatic rollback",
+    "Configurable sharding for high throughput",
+    "Capacity reservation to prevent starvation",
+    "React hooks for client-side integration",
+    "Fairness guarantees via credit reservation",
+    "Efficient storage not proportional to requests"
+  ],
+  "publicApiSurface": [
+    "RateLimiter",
+    "RateLimiter.limit()",
+    "RateLimiter.check()",
+    "RateLimiter.reset()",
+    "RateLimiter.getValue()",
+    "RateLimiter.hookAPI()",
+    "useRateLimit",
+    "calculateRateLimit",
+    "isRateLimitError",
+    "SECOND",
+    "MINUTE",
+    "HOUR",
+    "DAY",
+    "WEEK",
+    "RateLimitConfig",
+    "RateLimitArgs",
+    "RateLimitReturns",
+    "RateLimitError"
+  ]
+}
